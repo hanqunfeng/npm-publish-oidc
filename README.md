@@ -11,16 +11,17 @@
 - bash、git、Node.js、npm
 - 监控发布进度时需要已登录的 [GitHub CLI](https://cli.github.com/)（`gh auth login`）
 
-给脚本执行权限，并把所在目录加入 `PATH`：
+克隆仓库，确认脚本可执行，并把克隆目录加入 `PATH`：
 
 ```bash
-chmod +x /Users/hanqf/brew_workspace/npm-publish-oidc/npm-publish-oidc
+git clone https://github.com/hanqunfeng/npm-publish-oidc.git ~/npm-publish-oidc
+chmod +x ~/npm-publish-oidc/npm-publish-oidc
 ```
 
 在 `~/.zshrc` 中加入：
 
 ```bash
-export PATH="/Users/hanqf/brew_workspace/npm-publish-oidc:$PATH"
+export PATH="$HOME/npm-publish-oidc:$PATH"
 ```
 
 新开一个终端后确认：
