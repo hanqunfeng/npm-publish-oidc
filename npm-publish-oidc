@@ -1,0 +1,896 @@
+#!/usr/bin/env bash
+# 通用的 npm OIDC 发布命令。
+# 把本文件所在目录加入 PATH 后，可在任意项目根目录执行 npm-publish-oidc。
+# 项目根目录始终是运行命令时的当前工作目录，不会切换到脚本所在目录。
+#
+# 本地只负责检查代码、提升版本和推送标签；真正的 npm publish 由项目里的
+# GitHub Actions 工作流使用 npm Trusted Publishing（OIDC）完成。
+#
+# 用法:
+#   npm-publish-oidc                 推送当前版本标签（不提升版本）
+#   npm-publish-oidc patch           提升补丁版本并推送 commit + 标签
+#   npm-publish-oidc minor           提升次版本并推送 commit + 标签
+#   npm-publish-oidc major           提升主版本并推送 commit + 标签
+#   npm-publish-oidc --check         只执行本地检查
+#   npm-publish-oidc --dry-run       检查并显示计划操作
+#   npm-publish-oidc --no-watch      推送后不等待 Actions
+#   npm-publish-oidc --workflow FILE 指定 .github/workflows 下的工作流文件名
+#   npm-publish-oidc --init          缺少 publish.yml 时创建基础模板，不发布
+
+# 遇到命令失败、未定义变量或管道中任一命令失败时立即退出。
+set -euo pipefail
+
+CMD_NAME="$(basename "$0")"
+# 定位脚本真实所在目录，以便读取旁边的 publish.yml.tmpl。兼容符号链接。
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+	SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+	SOURCE="$(readlink "$SOURCE")"
+	[[ "$SOURCE" != /* ]] && SOURCE="${SCRIPT_DIR}/${SOURCE}"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+unset SOURCE
+# 包名、版本和仓库都从当前项目读取，不在脚本里写死。
+PACKAGE=""
+VERSION=""
+HAS_BIN=0
+GITHUB_REPO=""
+WORKFLOW_FILE=""
+# 网络查询和推送统一最多尝试 10 次，每次间隔 3 秒。
+NETWORK_MAX_ATTEMPTS=10
+NETWORK_RETRY_DELAY=3
+# 默认等待工作流结束；--no-watch 会把该开关改为 false。
+WATCH_WORKFLOW=true
+# 发布前两项检查的失败标记。两项都跑完再退出，便于一次看到全部问题。
+CHECK_FAILED=0
+
+# 输出普通进度信息，并使用统一前缀方便阅读日志。
+log() { echo "==> $*"; }
+
+# 将致命错误写入标准错误并立即终止脚本。
+die() { echo "错误: $*" >&2; exit 1; }
+
+# 记录一项发布前检查失败，但不立刻退出。
+fail() { echo "错误: $*" >&2; CHECK_FAILED=1; }
+
+# 将非致命警告写入标准错误，但允许脚本继续执行。
+warn() { echo "警告: $*" >&2; }
+
+# 执行可能因网络波动失败的命令，并按统一次数和间隔进行重试。
+# 第一个参数是日志中的操作说明，剩余参数组成真正要执行的命令。
+# 命令成功时返回 0；耗尽重试次数后返回 1。
+retry_network() {
+	local desc="$1"
+	shift
+	local attempt
+	for ((attempt = 1; attempt <= NETWORK_MAX_ATTEMPTS; attempt++)); do
+		if "$@"; then
+			return 0
+		fi
+		if [[ $attempt -lt $NETWORK_MAX_ATTEMPTS ]]; then
+			log "网络操作失败，重试 ($attempt/$NETWORK_MAX_ATTEMPTS): $desc"
+			sleep "$NETWORK_RETRY_DELAY"
+		fi
+	done
+	return 1
+}
+
+# 输出命令行用法。--help 可以在任意目录执行。
+usage() {
+	cat <<EOF
+用法: $CMD_NAME [patch|minor|major] [选项]
+
+在要发布的项目根目录中执行。当前工作目录会作为项目根目录。
+
+  (无参数)           推送当前 package.json 版本对应的 vX.Y.Z 标签，触发 OIDC 发布
+  patch              升补丁版本后推送 (x.y.Z)
+  minor              升次版本后推送 (x.Y.0)
+  major              升主版本后推送 (X.0.0)
+  --check            仅运行本地发布前检查
+  --dry-run          检查并预览将执行的操作，不推送
+  --no-watch         推送后不等待 GitHub Actions 完成
+  --workflow FILE    指定 .github/workflows 下的工作流文件名，例如 publish.yml
+  --init             缺少 publish.yml 时创建基础模板。独立命令，不发布
+
+选项可与 patch/minor/major 组合，顺序不限。--init 不能和其他参数一起使用。
+
+运行后会先确认两件事，再继续其他检查:
+  1. 当前目录是可以发布到 npm 的项目
+     存在合法的 package.json，包含可发布的 name 和 version，且 private 不为 true
+  2. 当前目录是 git 仓库根目录
+
+其他前置条件:
+  Git: 工作区干净，origin 指向 GitHub 仓库
+  GitHub Actions: 工作流在推送 v* 标签时执行 npm publish，并声明 id-token: write
+  GitHub CLI: 已安装并登录 (gh auth login)，用于监控发布进度
+  npm Trusted Publisher: 已按该 GitHub 仓库和工作流文件名配置
+
+本地不会执行 npm publish，发布由 GitHub Actions 通过 OIDC 完成。
+EOF
+}
+
+# 从 package.json 读取当前版本号，例如 3.0.12。
+get_package_version() {
+	node -p "require('./package.json').version"
+}
+
+# 将 package.json 版本转换成 Git 标签格式，例如 3.0.12 转为 v3.0.12。
+get_version_tag() {
+	echo "v$(get_package_version)"
+}
+
+# 读取 package.json 的 name、version 和 bin，并输出机器可解析的检查结果。
+# 成功时输出一行 OK、包名、版本、是否包含 bin。
+# 失败时每行一个错误码，调用方把错误码翻译成中文说明。
+read_package_publish_meta() {
+	node -e 'const fs = require("fs");
+let pkg;
+try { pkg = JSON.parse(fs.readFileSync("package.json", "utf8")); }
+catch (e) { console.log("INVALID_JSON"); process.exit(0); }
+if (!pkg || typeof pkg !== "object" || Array.isArray(pkg)) { console.log("NOT_OBJECT"); process.exit(0); }
+const name = typeof pkg.name === "string" ? pkg.name : "";
+const version = typeof pkg.version === "string" ? pkg.version : "";
+const nameOk = /^(?:@[a-z0-9~-][a-z0-9._~-]*\/)?[a-z0-9~-][a-z0-9._~-]*$/.test(name) && name.length <= 214;
+const versionOk = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-.]+)?(?:\+[0-9A-Za-z-.]+)?$/.test(version);
+let failed = false;
+if (pkg.private === true) { console.log("PRIVATE"); failed = true; }
+if (!name) { console.log("MISSING_NAME"); failed = true; }
+else if (!nameOk) { console.log("BAD_NAME\t" + name); failed = true; }
+if (!version) { console.log("MISSING_VERSION"); failed = true; }
+else if (!versionOk) { console.log("BAD_VERSION\t" + version); failed = true; }
+if (failed) process.exit(0);
+const hasBin = (typeof pkg.bin === "string" && pkg.bin.trim()) || (pkg.bin && typeof pkg.bin === "object" && !Array.isArray(pkg.bin) && Object.keys(pkg.bin).length > 0) ? "1" : "0";
+console.log(["OK", name, version, hasBin].join("\t"));
+'
+}
+
+# 确认当前目录是一个可以发布到 npm 的项目。
+# 只检查当前目录的 package.json，不会向上层目录查找。
+validate_npm_project() {
+	local tools_ok=1
+	if ! command -v node >/dev/null 2>&1; then
+		fail "未安装 Node.js，无法确认当前目录是可发布的 npm 项目"
+		tools_ok=0
+	fi
+	if ! command -v npm >/dev/null 2>&1; then
+		fail "未安装 npm，无法发布到 npm"
+		tools_ok=0
+	fi
+	[[ $tools_ok -eq 1 ]] || return 0
+	if [[ ! -f package.json ]]; then
+		fail "当前目录没有 package.json，不是可发布的 npm 项目"
+		return 0
+	fi
+
+	local meta line
+	if ! meta="$(read_package_publish_meta)"; then
+		fail "无法读取 package.json"
+		return 0
+	fi
+	if [[ -z "$meta" ]]; then
+		fail "无法读取 package.json 的发布信息"
+		return 0
+	fi
+
+	while IFS= read -r line; do
+		[[ -n "$line" ]] || continue
+		case "$line" in
+			OK$'\t'*)
+				IFS=$'\t' read -r _ PACKAGE VERSION HAS_BIN <<<"$line"
+				;;
+			INVALID_JSON)
+				fail "package.json 不是合法 JSON，不能发布到 npm"
+				;;
+			NOT_OBJECT)
+				fail "package.json 的内容必须是 JSON 对象"
+				;;
+			PRIVATE)
+				fail "package.json 的 private 为 true，不能发布到 npm"
+				;;
+			MISSING_NAME)
+				fail "package.json 缺少 name，不能发布到 npm"
+				;;
+			BAD_NAME$'\t'*)
+				fail "package.json 的 name 不是合法的 npm 包名: ${line#*$'\t'}"
+				;;
+			MISSING_VERSION)
+				fail "package.json 缺少 version，不能发布到 npm"
+				;;
+			BAD_VERSION$'\t'*)
+				fail "package.json 的 version 不是合法的语义化版本: ${line#*$'\t'}"
+				;;
+			*)
+				fail "无法识别 package.json 检查结果: $line"
+				;;
+		esac
+	done <<<"$meta"
+}
+
+# 确认当前目录就是 git 仓库根目录，而不是仓库中的子目录。
+validate_git_root() {
+	if ! command -v git >/dev/null 2>&1; then
+		fail "未安装 git，无法确认当前目录是 git 仓库根目录"
+		return 0
+	fi
+	if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		fail "当前目录不是 git 仓库。请在 git 仓库根目录运行 $CMD_NAME"
+		return 0
+	fi
+	local top cwd
+	top="$(git rev-parse --show-toplevel)" || {
+		fail "无法解析 git 仓库根目录"
+		return 0
+	}
+	cwd="$(pwd -P)"
+	top="$(cd "$top" && pwd -P)"
+	if [[ "$cwd" != "$top" ]]; then
+		fail "当前目录不是 git 仓库根目录。请切换到仓库根目录后再发布: $top"
+		return 0
+	fi
+}
+
+# 先做 npm 可发布性和 git 根目录两项检查。都失败时一次报出，避免来回重跑。
+check_publish_context() {
+	CHECK_FAILED=0
+	validate_npm_project
+	validate_git_root
+	if [[ $CHECK_FAILED -ne 0 ]]; then
+		exit 1
+	fi
+	log "可发布的 npm 项目: ${PACKAGE}@${VERSION}"
+	log "当前目录是 git 仓库根目录"
+}
+
+# 读取 package.json 中某个 script 的命令。脚本不存在时输出空字符串。
+package_script() {
+	node -e 'const pkg = require("./package.json"); const scripts = pkg.scripts || {}; const value = scripts[process.argv[1]]; if (typeof value === "string") process.stdout.write(value);' "$1"
+}
+
+# npm init 生成的默认 test 脚本会主动失败，不能把它当成项目测试。
+is_placeholder_test() {
+	[[ "$1" == *"no test specified"* ]]
+}
+
+# 按项目实际定义的脚本做发布前检查，不假设固定的 typecheck、build 或测试命令。
+run_checks() {
+	local typecheck_cmd build_cmd unit_cmd test_cmd
+	typecheck_cmd="$(package_script typecheck)"
+	build_cmd="$(package_script build)"
+	unit_cmd="$(package_script test:unit)"
+	test_cmd="$(package_script test)"
+
+	if [[ -n "$typecheck_cmd" ]]; then
+		log "运行 typecheck..."
+		npm run typecheck
+	else
+		log "跳过 typecheck（package.json 未定义该脚本）"
+	fi
+
+	if [[ -n "$build_cmd" ]]; then
+		log "构建项目..."
+		npm run build
+	else
+		log "跳过 build（package.json 未定义该脚本）"
+	fi
+
+	if [[ -n "$unit_cmd" ]] && ! is_placeholder_test "$unit_cmd"; then
+		log "运行 test:unit..."
+		npm run test:unit
+	elif [[ -n "$test_cmd" ]] && ! is_placeholder_test "$test_cmd"; then
+		log "运行 test..."
+		npm test
+	else
+		log "跳过测试（未定义 test:unit 或 test，或 test 仍是 npm 占位命令）"
+	fi
+
+	log "预览发布包..."
+	npm pack --dry-run
+}
+
+# 判断工作流是否会通过 OIDC 执行 npm publish。
+workflow_is_oidc_publish() {
+	local file="$1"
+	grep -q 'npm publish' "$file" && grep -Eq "id-token:[[:space:]]*['\"]?write['\"]?" "$file"
+}
+
+# 标签推送是这个发布流程的触发方式。缺少 tags 时只警告，便于兼容额外的触发条件。
+warn_if_no_tag_trigger() {
+	local file="$1"
+	if ! grep -q 'tags:' "$file"; then
+		warn "工作流 ${WORKFLOW_FILE} 中未发现 tags 触发条件，推送版本标签后可能不会启动发布"
+	fi
+}
+
+# 已有其他 OIDC 工作流时仍允许创建 publish.yml，但要说明发布时会优先使用新文件。
+warn_other_oidc_workflows() {
+	[[ -d .github/workflows ]] || return 0
+	local nullglob_on=0
+	shopt -q nullglob && nullglob_on=1
+	shopt -s nullglob
+	local -a found=()
+	local f base
+	for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+		base="$(basename "$f")"
+		[[ "$base" == "publish.yml" || "$base" == "publish.yaml" ]] && continue
+		if workflow_is_oidc_publish "$f"; then
+			found+=("$base")
+		fi
+	done
+	if [[ $nullglob_on -eq 0 ]]; then
+		shopt -u nullglob
+	fi
+	if [[ ${#found[@]} -gt 0 ]]; then
+		warn "已存在其他 OIDC 发布工作流: ${found[*]}。创建 publish.yml 后，发布时会优先使用 publish.yml"
+	fi
+}
+
+# 读取 origin，供模板注释填写 Trusted Publisher 的仓库信息。没有远程时保留占位文字。
+read_github_repo_parts() {
+	local url="" slug=""
+	REPO_OWNER="请填写"
+	REPO_NAME="请填写"
+	if ! url="$(git remote get-url origin 2>/dev/null)"; then
+		return 0
+	fi
+	if slug="$(github_repo_from_url "$url")"; then
+		REPO_OWNER="${slug%%/*}"
+		REPO_NAME="${slug#*/}"
+	fi
+}
+
+# scope 包首次发布需要公开访问级别。项目已声明 publishConfig.access 时保留 npm 自己的配置。
+npm_publish_command() {
+	local access=""
+	if [[ "$PACKAGE" != @* ]]; then
+		printf '%s\n' "npm publish"
+		return 0
+	fi
+	access="$(node -p "const pkg=require('./package.json'); const access=pkg.publishConfig && pkg.publishConfig.access; access ? String(access) : ''")"
+	if [[ -n "$access" ]]; then
+		printf '%s\n' "npm publish"
+		return 0
+	fi
+	printf '%s\n' "npm publish --access public"
+}
+
+# 把 publish.yml.tmpl 复制到目标文件，再替换占位符。模板用引用内容保存 ${{ }}，避免被当前 shell 展开。
+write_basic_publish_workflow() {
+	local path="$1" publish_cmd="$2" template tmp
+	template="${SCRIPT_DIR}/publish.yml.tmpl"
+	[[ -f "$template" ]] || die "未找到工作流模板: $template"
+	tmp="$(mktemp "${path}.XXXXXX")"
+	cp "$template" "$tmp"
+	if ! node -e '
+const fs = require("fs");
+const file = process.argv[1];
+let text = fs.readFileSync(file, "utf8");
+const pairs = [
+  ["__PACKAGE_NAME__", process.argv[2]],
+  ["__PUBLISH_CMD__", process.argv[3]],
+  ["__REPO_OWNER__", process.argv[4]],
+  ["__REPO_NAME__", process.argv[5]],
+];
+for (const [key, value] of pairs) {
+  if (!text.includes(key)) {
+    console.error("模板缺少占位符 " + key);
+    process.exit(1);
+  }
+  text = text.split(key).join(value);
+}
+fs.writeFileSync(file, text);
+' "$tmp" "$PACKAGE" "$publish_cmd" "$REPO_OWNER" "$REPO_NAME"; then
+		rm -f "$tmp"
+		die "无法生成 $path"
+	fi
+	mv "$tmp" "$path"
+}
+
+# 创建后提醒模板的边界，方便按项目补上构建、测试或安装命令。
+warn_basic_template_limits() {
+	local test_cmd=""
+	if [[ ! -f package-lock.json && ! -f npm-shrinkwrap.json ]]; then
+		warn "当前目录没有 package-lock.json，模板中的 npm ci 会失败。请先生成 lockfile，或改成适合本项目的安装命令"
+	fi
+	test_cmd="$(package_script test)"
+	if [[ -z "$test_cmd" ]] || is_placeholder_test "$test_cmd"; then
+		warn "当前项目没有可用的 test 脚本，模板中的 npm test 步骤需要删除或改成实际的检查命令"
+	fi
+}
+
+# --init 的独立入口：只在缺少 publish.yml 时创建基础模板，不进入发布流程。
+init_publish_workflow() {
+	local path=".github/workflows/publish.yml" publish_cmd
+	if [[ -e "$path" ]]; then
+		echo "已存在 $path，未做修改。"
+		return 0
+	fi
+	if [[ -e .github/workflows/publish.yaml ]]; then
+		die "已存在 .github/workflows/publish.yaml。请直接修改该文件，或将其改名为 publish.yml"
+	fi
+
+	warn_other_oidc_workflows
+	read_github_repo_parts
+	publish_cmd="$(npm_publish_command)"
+	mkdir -p .github/workflows
+	write_basic_publish_workflow "$path" "$publish_cmd"
+	echo ""
+	echo "已创建 $path"
+	echo "这只是一个最基础的模板文件，可以按需进行修改。"
+	warn_basic_template_limits
+}
+
+# 自动选择 OIDC 发布工作流。存在 publish.yml 时优先使用它。
+discover_workflow() {
+	local path
+	if [[ -n "$WORKFLOW_FILE" ]]; then
+		[[ "$WORKFLOW_FILE" != */* && "$WORKFLOW_FILE" != *..* ]] || die "--workflow 只能是文件名，例如 publish.yml"
+		[[ "$WORKFLOW_FILE" == *.yml || "$WORKFLOW_FILE" == *.yaml ]] || die "--workflow 需要是 .yml 或 .yaml 文件"
+		path=".github/workflows/$WORKFLOW_FILE"
+		[[ -f "$path" ]] || die "未找到工作流文件 $path"
+		workflow_is_oidc_publish "$path" || die "工作流 $WORKFLOW_FILE 需要执行 npm publish，并声明 permissions.id-token: write"
+		warn_if_no_tag_trigger "$path"
+		log "使用工作流: $WORKFLOW_FILE"
+		return 0
+	fi
+
+	[[ -d .github/workflows ]] || die "当前项目没有 .github/workflows，无法通过 GitHub Actions OIDC 发布"
+
+	local nullglob_on=0
+	shopt -q nullglob && nullglob_on=1
+	shopt -s nullglob
+	local -a found=()
+	local f
+	for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+		if workflow_is_oidc_publish "$f"; then
+			found+=("$(basename "$f")")
+		fi
+	done
+	if [[ $nullglob_on -eq 0 ]]; then
+		shopt -u nullglob
+	fi
+
+	if [[ ${#found[@]} -eq 0 ]]; then
+		die "未找到 OIDC 发布工作流。请添加 .github/workflows/publish.yml，使其在推送 v* 标签时执行 npm publish，并声明 id-token: write。也可使用 --workflow 指定文件名"
+	fi
+
+	local name candidate=""
+	for name in "${found[@]}"; do
+		if [[ "$name" == "publish.yml" || "$name" == "publish.yaml" ]]; then
+			candidate="$name"
+			break
+		fi
+	done
+	if [[ -z "$candidate" && ${#found[@]} -eq 1 ]]; then
+		candidate="${found[0]}"
+	fi
+	if [[ -z "$candidate" ]]; then
+		die "找到多个 OIDC 发布工作流: ${found[*]}。请使用 --workflow 指定文件名"
+	fi
+	WORKFLOW_FILE="$candidate"
+	warn_if_no_tag_trigger ".github/workflows/$WORKFLOW_FILE"
+	log "使用工作流: $WORKFLOW_FILE"
+}
+
+# 从 origin 地址提取 GitHub 的 owner/repo。
+# 支持 git@、https、http、ssh 和 git 协议，并去掉用户信息和 .git 后缀。
+github_repo_from_url() {
+	local url="$1" repo=""
+	url="${url%%\?*}"
+	url="${url%/}"
+	if [[ "$url" =~ ^git@github\.com:(.+)$ ]]; then
+		repo="${BASH_REMATCH[1]}"
+	elif [[ "$url" =~ ^ssh://([^@]+@)?github\.com/(.+)$ ]]; then
+		repo="${BASH_REMATCH[2]}"
+	elif [[ "$url" =~ ^https?://([^@/]+@)?github\.com/(.+)$ ]]; then
+		repo="${BASH_REMATCH[2]}"
+	elif [[ "$url" =~ ^git://github\.com/(.+)$ ]]; then
+		repo="${BASH_REMATCH[1]}"
+	else
+		return 1
+	fi
+	repo="${repo%%\?*}"
+	repo="${repo%/}"
+	repo="${repo%.git}"
+	[[ "$repo" =~ ^[^/]+/[^/]+$ ]] || return 1
+	printf '%s\n' "$repo"
+}
+
+# 日志中隐藏 https 远程地址里的用户名和 token。
+redact_git_url() {
+	local url="$1" scheme
+	if [[ "$url" =~ ^https?://[^@/]+@(.+)$ ]]; then
+		scheme="${url%%://*}"
+		printf '%s://***@%s\n' "$scheme" "${BASH_REMATCH[1]}"
+		return 0
+	fi
+	printf '%s\n' "$url"
+}
+
+# 确认 origin 存在，并且指向 GitHub 仓库。
+check_remote_configured() {
+	local url repo
+	url="$(git remote get-url origin 2>/dev/null)" || die "未配置 origin 远程"
+	log "origin: $(redact_git_url "$url")"
+	repo="$(github_repo_from_url "$url")" || die "origin 不是 GitHub 仓库地址，OIDC 发布需要 GitHub 远程: $(redact_git_url "$url")"
+	GITHUB_REPO="$repo"
+	log "GitHub 仓库: $GITHUB_REPO"
+}
+
+# 检查 GitHub CLI 是否已安装并登录。
+check_gh_auth() {
+	command -v gh >/dev/null 2>&1 || die "未安装 GitHub CLI。请安装: https://cli.github.com/"
+	retry_network "gh auth status" gh auth status >/dev/null \
+		|| die "GitHub CLI 未登录或无法连接 GitHub。请运行: gh auth login"
+	log "GitHub CLI 已认证"
+}
+
+# 确认 Git 工作区没有已修改、已暂存或未跟踪的文件。
+check_git_clean() {
+	if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+		die "工作区有未提交的更改，请先 commit 或 stash"
+	fi
+	log "git 工作区干净"
+}
+
+# 检查当前分支是否为 main/master。其他分支只警告，不终止发布。
+check_on_main_branch() {
+	local branch
+	branch="$(git branch --show-current 2>/dev/null || true)"
+	if [[ -n "$branch" && "$branch" != "main" && "$branch" != "master" ]]; then
+		warn "当前分支为 '$branch'，建议在 main 分支发布"
+	fi
+}
+
+# 查询 npm 上该包的 latest 版本。
+# 返回 0 并把版本写到标准输出；返回 2 表示注册表没有这个包；返回 1 表示查询失败。
+query_published_version() {
+	local err_file out rc
+	err_file="$(mktemp)"
+	set +e
+	out="$(npm view "$PACKAGE" version --prefer-online 2>"$err_file")"
+	rc=$?
+	set -e
+	if [[ $rc -eq 0 ]]; then
+		rm -f "$err_file"
+		printf '%s' "$out"
+		return 0
+	fi
+	if grep -q 'E404' "$err_file"; then
+		rm -f "$err_file"
+		return 2
+	fi
+	rm -f "$err_file"
+	return 1
+}
+
+# 将 package.json 版本与 npm 当前 latest 版本比较，阻止明显的重复发布。
+# 包还不存在时视为首次发布。查询失败时重试，耗尽次数后继续，由 Actions 里的 npm publish 再校验。
+check_not_already_published() {
+	local version published attempt rc
+	version="$(get_package_version)"
+	published=""
+	rc=1
+	for ((attempt = 1; attempt <= NETWORK_MAX_ATTEMPTS; attempt++)); do
+		rc=0
+		published="$(query_published_version)" || rc=$?
+		published="${published//[[:space:]]/}"
+		if [[ $rc -eq 0 || $rc -eq 2 ]]; then
+			break
+		fi
+		published=""
+		if [[ $attempt -lt $NETWORK_MAX_ATTEMPTS ]]; then
+			log "查询 npm 版本失败，重试 ($attempt/$NETWORK_MAX_ATTEMPTS)"
+			sleep "$NETWORK_RETRY_DELAY"
+		else
+			warn "无法查询 npm 当前版本（已重试 $NETWORK_MAX_ATTEMPTS 次），继续发布"
+		fi
+	done
+	if [[ $rc -eq 0 && "$published" == "$version" ]]; then
+		die "版本 $version 已在 npm 上发布。请先用 patch/minor/major 升版本"
+	fi
+	if [[ $rc -eq 2 ]]; then
+		log "将首次发布: $version（npm 上尚无 $PACKAGE）"
+		return 0
+	fi
+	log "将发布新版本: $version（npm 当前最新: ${published:-无}）"
+}
+
+# 输出 Trusted Publisher 配置提醒。npm 上的仓库和工作流文件名必须与这里一致。
+check_trusted_publisher_hint() {
+	log "发布将由 GitHub Actions (${WORKFLOW_FILE}) 通过 OIDC 完成"
+	log "请确认 npm 已配置 Trusted Publisher: ${GITHUB_REPO} / ${WORKFLOW_FILE}"
+}
+
+# 使用 npm version 按 patch/minor/major 提升版本。
+# npm version 会修改 package.json 和 lock 文件，并创建 release commit 与 vX.Y.Z 标签。
+bump_version() {
+	local level="$1"
+	log "升级版本 ($level)..."
+	npm version "$level" -m "chore: release v%s"
+}
+
+# 确保当前版本标签存在于本地。不升版本发布时由此函数补建。
+ensure_local_tag() {
+	local tag="$1"
+	if git rev-parse "$tag" >/dev/null 2>&1; then
+		log "本地 tag $tag 已存在"
+		return 0
+	fi
+	log "创建本地 tag $tag..."
+	git tag "$tag"
+}
+
+# 查询指定标签是否已存在于 origin。
+# 返回状态：0=标签存在，1=标签不存在，2=远程查询在重试后仍然失败。
+remote_has_tag() {
+	local tag="$1" output attempt
+	for ((attempt = 1; attempt <= NETWORK_MAX_ATTEMPTS; attempt++)); do
+		if output="$(git ls-remote --tags origin "refs/tags/${tag}" 2>&1)"; then
+			if echo "$output" | grep -q "refs/tags/${tag}"; then
+				return 0
+			fi
+			return 1
+		fi
+		if [[ $attempt -lt $NETWORK_MAX_ATTEMPTS ]]; then
+			log "查询远程 tag 失败，重试 ($attempt/$NETWORK_MAX_ATTEMPTS): $tag"
+			sleep "$NETWORK_RETRY_DELAY"
+		fi
+	done
+	return 2
+}
+
+# 先推送当前 commit，再推送触发工作流的版本标签。
+push_git() {
+	local tag="$1"
+	log "推送 commit 到 origin..."
+	retry_network "git push origin HEAD" git push origin HEAD \
+		|| die "git push 失败（已重试 $NETWORK_MAX_ATTEMPTS 次）"
+
+	local remote_status=0
+	remote_has_tag "$tag" || remote_status=$?
+	if [[ $remote_status -eq 0 ]]; then
+		warn "远程 tag $tag 已存在，跳过 git push --tags"
+		return 0
+	fi
+	if [[ $remote_status -eq 2 ]]; then
+		die "无法确认远程 tag $tag 是否存在（已重试 $NETWORK_MAX_ATTEMPTS 次）"
+	fi
+
+	log "推送 tag $tag 到 origin..."
+	retry_network "git push origin $tag" git push origin "$tag" \
+		|| die "git push tag $tag 失败（已重试 $NETWORK_MAX_ATTEMPTS 次）"
+}
+
+# 等待标签对应的工作流出现，并持续监控到运行结束。
+watch_workflow() {
+	local tag="$1" run_id attempt=0 list_failed=0
+	log "等待 GitHub Actions 工作流启动..."
+	while ((attempt < 30)); do
+		if run_id="$(gh run list \
+			--repo "$GITHUB_REPO" \
+			--workflow "$WORKFLOW_FILE" \
+			--branch "$tag" \
+			--limit 1 \
+			--json databaseId,status,conclusion \
+			--jq '.[0].databaseId // empty' 2>/dev/null)"; then
+			list_failed=0
+			if [[ -n "$run_id" ]]; then
+				break
+			fi
+		else
+			list_failed=1
+			run_id=""
+			log "查询工作流失败，重试 ($((attempt + 1))/30)"
+		fi
+		sleep 2
+		((attempt += 1))
+	done
+
+	if [[ -z "$run_id" ]]; then
+		if [[ $list_failed -eq 1 ]]; then
+			die "无法查询 GitHub Actions（已重试 30 次）。请稍后查看: gh run list --repo $GITHUB_REPO --workflow $WORKFLOW_FILE"
+		fi
+		warn "未找到对应的工作流运行，请手动查看:"
+		warn "  gh run list --repo $GITHUB_REPO --workflow $WORKFLOW_FILE"
+		return 0
+	fi
+
+	log "监控工作流运行 #$run_id ..."
+	local state status conclusion
+	for ((attempt = 1; attempt <= NETWORK_MAX_ATTEMPTS; attempt++)); do
+		if gh run watch "$run_id" --repo "$GITHUB_REPO" --exit-status; then
+			log "GitHub Actions 发布成功"
+			return 0
+		fi
+
+		state="$(gh run view "$run_id" --repo "$GITHUB_REPO" \
+			--json status,conclusion \
+			--jq '[.status // "", .conclusion // ""] | @tsv' 2>/dev/null || true)"
+		status="${state%%$'\t'*}"
+		conclusion="${state#*$'\t'}"
+		if [[ "$status" == "completed" ]]; then
+			if [[ "$conclusion" == "success" ]]; then
+				log "GitHub Actions 发布成功"
+				return 0
+			fi
+			die "GitHub Actions 发布失败。查看日志: gh run view $run_id --repo $GITHUB_REPO --log-failed"
+		fi
+
+		if [[ $attempt -lt $NETWORK_MAX_ATTEMPTS ]]; then
+			log "监控连接断开，重新连接 ($attempt/$NETWORK_MAX_ATTEMPTS): run #$run_id"
+			sleep "$NETWORK_RETRY_DELAY"
+		fi
+	done
+	die "监控工作流 #$run_id 失败（已重试 $NETWORK_MAX_ATTEMPTS 次）。查看日志: gh run view $run_id --repo $GITHUB_REPO --log-failed"
+}
+
+# 轮询 npm 注册表，确认 Actions 发布的 latest 版本已同步为本地版本。
+verify_publish() {
+	local version published attempt rc
+	version="$(get_package_version)"
+	log "验证 npm 上的版本..."
+	for ((attempt = 1; attempt <= NETWORK_MAX_ATTEMPTS; attempt++)); do
+		rc=0
+		published="$(query_published_version)" || rc=$?
+		published="${published//[[:space:]]/}"
+		if [[ $rc -eq 0 && "$published" == "$version" ]]; then
+			log "发布成功: $PACKAGE@$version"
+			log "本地已查到该版本，无需再执行 Actions 日志中的复查命令"
+			echo ""
+			echo "  npm:     https://www.npmjs.com/package/${PACKAGE#@}"
+			echo "  GitHub:  https://github.com/${GITHUB_REPO}/releases/tag/v${version}"
+			if [[ "$HAS_BIN" == "1" ]]; then
+				echo "  安装:    npm install -g $PACKAGE"
+			else
+				echo "  安装:    npm install $PACKAGE"
+			fi
+			return 0
+		fi
+		if [[ $attempt -lt $NETWORK_MAX_ATTEMPTS ]]; then
+			log "等待 npm 注册表同步 ($attempt/$NETWORK_MAX_ATTEMPTS): npm=${published:-无}, 本地=$version"
+			sleep "$NETWORK_RETRY_DELAY"
+		fi
+	done
+	warn "npm 注册表尚未同步到 $version。包已发布。可稍后执行:"
+	warn "  npm view $PACKAGE version"
+	warn "  npm view ${PACKAGE}@${version} version"
+}
+
+# 输出已触发发布的标签、工作流文件和 GitHub Actions 页面地址。
+print_summary() {
+	local tag="$1"
+	echo ""
+	echo "已触发 OIDC 发布:"
+	echo "  包:       $PACKAGE@$(get_package_version)"
+	echo "  标签:     $tag"
+	echo "  仓库:     $GITHUB_REPO"
+	echo "  工作流:   .github/workflows/${WORKFLOW_FILE}"
+	echo "  操作面板: https://github.com/${GITHUB_REPO}/actions/workflows/${WORKFLOW_FILE}"
+}
+
+# 解析参数并编排发布流程。
+# --help 可以在任意目录使用。其他命令会先检查当前目录，再执行对应模式。
+main() {
+	local mode="" bump=""
+
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			-h | --help)
+				usage
+				exit 0
+				;;
+			--check)
+				if [[ -n "$mode" && "$mode" != "check" ]]; then
+					die "不能同时指定 --check 和 --$mode"
+				fi
+				mode="check"
+				;;
+			--dry-run)
+				if [[ -n "$mode" && "$mode" != "dry-run" ]]; then
+					die "不能同时指定 --dry-run 和 --$mode"
+				fi
+				mode="dry-run"
+				;;
+			--init)
+				if [[ -n "$mode" && "$mode" != "init" ]]; then
+					die "不能同时指定 --init 和 --$mode"
+				fi
+				mode="init"
+				;;
+			--no-watch)
+				WATCH_WORKFLOW=false
+				;;
+			--workflow)
+				[[ $# -ge 2 ]] || die "--workflow 需要工作流文件名，例如 publish.yml"
+				shift
+				WORKFLOW_FILE="$1"
+				;;
+			patch | minor | major)
+				[[ -z "$bump" ]] || die "不能同时指定多个版本级别: $bump 和 $1"
+				bump="$1"
+				;;
+			*)
+				die "未知参数: $1（使用 --help 查看用法）"
+				;;
+		esac
+		shift
+	done
+
+	if [[ "$mode" == "init" ]]; then
+		if [[ -n "$bump" || -n "$WORKFLOW_FILE" || "$WATCH_WORKFLOW" == "false" ]]; then
+			die "--init 是独立命令，不能与版本级别或其他选项一起使用"
+		fi
+	fi
+
+	# 当前工作目录就是发布根目录。这里固定下来，避免后续命令改变相对路径的含义。
+	ROOT="$(pwd -P)"
+	cd "$ROOT"
+	log "项目根目录: $ROOT"
+	check_publish_context
+
+	case "$mode" in
+		init)
+			init_publish_workflow
+			exit 0
+			;;
+		check)
+			check_remote_configured
+			discover_workflow
+			run_checks
+			log "检查通过"
+			exit 0
+			;;
+		dry-run)
+			check_git_clean
+			check_on_main_branch
+			check_remote_configured
+			discover_workflow
+			run_checks
+			log "[dry-run] 包: $PACKAGE@$(get_package_version)"
+			log "[dry-run] 仓库: $GITHUB_REPO"
+			log "[dry-run] 工作流: .github/workflows/$WORKFLOW_FILE"
+			if [[ -n "$bump" ]]; then
+				log "[dry-run] 将执行: npm version $bump -m \"chore: release v%s\""
+			else
+				log "[dry-run] 将推送 tag: $(get_version_tag)"
+			fi
+			log "[dry-run] 将执行: git push origin HEAD && git push origin <tag>"
+			log "[dry-run] GitHub Actions 将自动发布到 npm 并创建 Release"
+			exit 0
+			;;
+		"")
+			;;
+		*)
+			die "内部错误: 未知模式 $mode"
+			;;
+	esac
+
+	check_git_clean
+	check_on_main_branch
+	check_remote_configured
+	discover_workflow
+	check_gh_auth
+	check_trusted_publisher_hint
+	run_checks
+
+	if [[ "$bump" == "patch" || "$bump" == "minor" || "$bump" == "major" ]]; then
+		bump_version "$bump"
+	else
+		check_not_already_published
+	fi
+
+	local tag
+	tag="$(get_version_tag)"
+	ensure_local_tag "$tag"
+	push_git "$tag"
+	print_summary "$tag"
+
+	if [[ "$WATCH_WORKFLOW" == "true" ]]; then
+		watch_workflow "$tag"
+		verify_publish
+	else
+		log "已跳过工作流监控 (--no-watch)"
+	fi
+}
+
+main "$@"
