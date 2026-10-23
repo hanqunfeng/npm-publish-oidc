@@ -13,6 +13,22 @@ Requirements:
 - bash, git, Node.js, and npm
 - A signed-in [GitHub CLI](https://cli.github.com/) (`gh auth login`) when you want to watch the publish run
 
+### Homebrew
+
+```bash
+brew install hanqunfeng/tap/npm-publish-oidc
+```
+
+Confirm the install:
+
+```bash
+npm-publish-oidc --help
+```
+
+Homebrew installs `npm-publish-oidc` and `publish.yml.tmpl` in the same directory and links the command onto `PATH`. Install Node.js, npm, and the GitHub CLI separately.
+
+### Clone from GitHub
+
 Clone the repository, make the script executable, and add the clone directory to `PATH`:
 
 ```bash

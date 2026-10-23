@@ -13,6 +13,22 @@
 - bash、git、Node.js、npm
 - 监控发布进度时需要已登录的 [GitHub CLI](https://cli.github.com/)（`gh auth login`）
 
+### Homebrew
+
+```bash
+brew install hanqunfeng/tap/npm-publish-oidc
+```
+
+安装后确认：
+
+```bash
+npm-publish-oidc --help
+```
+
+Homebrew 会把 `npm-publish-oidc` 和 `publish.yml.tmpl` 装到同一目录，并把命令链接到 `PATH`。Node.js、npm 和 GitHub CLI 需要另行安装。
+
+### 从 GitHub 克隆
+
 克隆仓库，确认脚本可执行，并把克隆目录加入 `PATH`：
 
 ```bash
