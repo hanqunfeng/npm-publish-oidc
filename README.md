@@ -87,10 +87,13 @@ npm-publish-oidc minor            # 0.1.0 → 0.2.0
 npm-publish-oidc major            # 0.1.0 → 1.0.0
 npm-publish-oidc                  # Do not bump; push the vX.Y.Z tag for the current version
 npm-publish-oidc --no-watch patch # Push without waiting for Actions
+npm-publish-oidc --yes patch      # Publish without asking for confirmation
 npm-publish-oidc --workflow release.yml patch
 ```
 
-`patch`, `minor`, and `major` can be combined with `--dry-run`, `--no-watch`, and `--workflow` in any order.
+A real publish prints the plan first and continues only after you enter `y`. `--yes` or `-y` skips that question. `--check`, `--dry-run`, and `--init` do not ask.
+
+`patch`, `minor`, and `major` can be combined with `--dry-run`, `--no-watch`, `--yes`, and `--workflow` in any order.
 
 If several OIDC publish workflows exist and none of them is `publish.yml`, pass the filename with `--workflow`.
 

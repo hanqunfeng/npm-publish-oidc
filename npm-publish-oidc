@@ -14,6 +14,7 @@
 #   npm-publish-oidc --check         只执行本地检查
 #   npm-publish-oidc --dry-run       检查并显示计划操作
 #   npm-publish-oidc --no-watch      推送后不等待 Actions
+#   npm-publish-oidc --yes           确认发布计划后直接发布
 #   npm-publish-oidc --workflow FILE 指定 .github/workflows 下的工作流文件名
 #   npm-publish-oidc --init          缺少 publish.yml 时创建基础模板，不发布
 
@@ -41,6 +42,8 @@ NETWORK_MAX_ATTEMPTS=10
 NETWORK_RETRY_DELAY=3
 # 默认等待工作流结束；--no-watch 会把该开关改为 false。
 WATCH_WORKFLOW=true
+# 正式发布前先展示计划并等待确认；--yes 跳过确认。
+ASSUME_YES=false
 # 发布前两项检查的失败标记。两项都跑完再退出，便于一次看到全部问题。
 CHECK_FAILED=0
 
@@ -89,6 +92,7 @@ usage() {
   --check            仅运行本地发布前检查
   --dry-run          检查并预览将执行的操作，不推送
   --no-watch         推送后不等待 GitHub Actions 完成
+  --yes, -y          展示发布计划后直接发布，不再询问确认
   --workflow FILE    指定 .github/workflows 下的工作流文件名，例如 publish.yml
   --init             缺少 publish.yml 时创建基础模板。独立命令，不发布
 
@@ -756,6 +760,85 @@ verify_publish() {
 	warn "  npm view ${PACKAGE}@${version} version"
 }
 
+# 预览 patch/minor/major 之后的版本号。只处理 X.Y.Z；带预发布后缀时留给 npm version。
+preview_bumped_version() {
+	local level="$1" version major minor patch
+	version="$(get_package_version)"
+	if [[ ! "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+		printf '%s\n' ""
+		return 0
+	fi
+	major="${BASH_REMATCH[1]}"
+	minor="${BASH_REMATCH[2]}"
+	patch="${BASH_REMATCH[3]}"
+	case "$level" in
+		patch) patch=$((patch + 1)) ;;
+		minor)
+			minor=$((minor + 1))
+			patch=0
+			;;
+		major)
+			major=$((major + 1))
+			minor=0
+			patch=0
+			;;
+	esac
+	printf '%s\n' "${major}.${minor}.${patch}"
+}
+
+# 正式发布前打印将要执行的版本、仓库和工作流。此时还没有提交或推送。
+print_publish_plan() {
+	local bump_label="无" next_version tag branch watch_label="是"
+	branch="$(git branch --show-current 2>/dev/null || true)"
+	if [[ -n "$bump" ]]; then
+		bump_label="$bump"
+		next_version="$(preview_bumped_version "$bump")"
+		if [[ -z "$next_version" ]]; then
+			next_version="npm version ${bump}"
+			tag="v<新版本>"
+		else
+			tag="v${next_version}"
+		fi
+	else
+		next_version="$VERSION"
+		tag="v${VERSION}"
+	fi
+	if [[ "$WATCH_WORKFLOW" != "true" ]]; then
+		watch_label="否"
+	fi
+	cat <<EOF
+
+========================================
+  npm-publish-oidc 发布计划
+========================================
+  包       : ${PACKAGE}
+  当前版本 : ${VERSION}
+  新版本   : ${next_version}  (tag: ${tag})
+  bump     : ${bump_label}
+  仓库     : ${GITHUB_REPO}
+  工作流   : .github/workflows/${WORKFLOW_FILE}
+  分支     : ${branch:-detached}
+  监控     : ${watch_label}
+========================================
+
+EOF
+}
+
+# 等待用户输入 y 或 Y。--yes 直接通过；其他输入或读到结尾则取消。
+confirm_publish() {
+	local reply=""
+	if [[ "$ASSUME_YES" == "true" ]]; then
+		log "已指定 --yes，按发布计划继续"
+		return 0
+	fi
+	printf '确认按上述计划发布？ [y/N] '
+	if ! read -r reply; then
+		printf '\n'
+		die "已取消"
+	fi
+	[[ "$reply" == "y" || "$reply" == "Y" ]] || die "已取消"
+}
+
 # 输出已触发发布的标签、工作流文件和 GitHub Actions 页面地址。
 print_summary() {
 	local tag="$1"
@@ -799,6 +882,9 @@ main() {
 				;;
 			--no-watch)
 				WATCH_WORKFLOW=false
+				;;
+			--yes | -y)
+				ASSUME_YES=true
 				;;
 			--workflow)
 				[[ $# -ge 2 ]] || die "--workflow 需要工作流文件名，例如 publish.yml"
@@ -869,6 +955,8 @@ main() {
 	check_on_main_branch
 	check_remote_configured
 	discover_workflow
+	print_publish_plan
+	confirm_publish
 	check_gh_auth
 	check_trusted_publisher_hint
 	run_checks

@@ -87,10 +87,13 @@ npm-publish-oidc minor            # 0.1.0 → 0.2.0
 npm-publish-oidc major            # 0.1.0 → 1.0.0
 npm-publish-oidc                  # 不升版本，推送当前版本的 vX.Y.Z 标签
 npm-publish-oidc --no-watch patch # 推送后不等待 Actions
+npm-publish-oidc --yes patch      # 展示计划后直接发布，不再询问
 npm-publish-oidc --workflow release.yml patch
 ```
 
-`patch`、`minor`、`major` 可与 `--dry-run`、`--no-watch`、`--workflow` 组合，顺序不限。
+正式发布会先输出发布计划，输入 `y` 后才继续。`--yes` 或 `-y` 跳过确认。`--check`、`--dry-run` 和 `--init` 不会询问。
+
+`patch`、`minor`、`major` 可与 `--dry-run`、`--no-watch`、`--yes`、`--workflow` 组合，顺序不限。
 
 有多个 OIDC 发布工作流、且其中没有 `publish.yml` 时，用 `--workflow` 指定文件名。
 
