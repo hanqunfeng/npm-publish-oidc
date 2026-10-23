@@ -1,103 +1,105 @@
 # npm-publish-oidc
 
-在任意 npm 项目根目录执行的 OIDC 发布命令。本地负责检查项目、提升版本并推送 `vX.Y.Z` 标签；`npm publish` 由该项目的 GitHub Actions 通过 npm Trusted Publishing 完成。
+[中文](README.zh-CN.md)
 
-当前工作目录就是项目根目录。脚本不会切换到自己所在的目录。
+OIDC publish command for any npm project. Run it from the project root. It checks the project, bumps the version, and pushes a `vX.Y.Z` tag. `npm publish` is done by that project's GitHub Actions workflow through npm Trusted Publishing.
 
-## 安装
+The current working directory is the project root. The script does not change to its own directory.
 
-依赖：
+## Install
 
-- bash、git、Node.js、npm
-- 监控发布进度时需要已登录的 [GitHub CLI](https://cli.github.com/)（`gh auth login`）
+Requirements:
 
-克隆仓库，确认脚本可执行，并把克隆目录加入 `PATH`：
+- bash, git, Node.js, and npm
+- A signed-in [GitHub CLI](https://cli.github.com/) (`gh auth login`) when you want to watch the publish run
+
+Clone the repository, make the script executable, and add the clone directory to `PATH`:
 
 ```bash
 git clone https://github.com/hanqunfeng/npm-publish-oidc.git ~/npm-publish-oidc
 chmod +x ~/npm-publish-oidc/npm-publish-oidc
 ```
 
-在 `~/.zshrc` 中加入：
+Add this to `~/.zshrc`:
 
 ```bash
 export PATH="$HOME/npm-publish-oidc:$PATH"
 ```
 
-新开一个终端后确认：
+Open a new terminal and confirm:
 
 ```bash
 npm-publish-oidc --help
 ```
 
-`publish.yml.tmpl` 必须和 `npm-publish-oidc` 放在同一目录。`--init` 通过脚本的真实路径读取它，符号链接调用也能找到。
+`publish.yml.tmpl` must stay in the same directory as `npm-publish-oidc`. `--init` loads it from the script's real path, including when the command is a symlink.
 
-## 项目要求
+## Project requirements
 
-除 `--help` 外，命令会先确认这两件事：
+Every command except `--help` first checks two things:
 
-1. 当前目录可以发布到 npm：存在合法的 `package.json`，包含可发布的 `name` 和语义化 `version`，且 `private` 不为 `true`。
-2. 当前目录是 git 仓库根目录。
+1. The current directory can be published to npm: it has a valid `package.json` with a publishable `name` and a semantic `version`, and `private` is not `true`.
+2. The current directory is the git repository root.
 
-正式发布和 `--dry-run` 还要求：
+A real publish and `--dry-run` also require:
 
-- 工作区干净
-- `origin` 指向 GitHub 仓库
-- `.github/workflows` 中有执行 `npm publish`、并声明 `id-token: write` 的工作流。存在 `publish.yml` 时优先使用它
+- A clean working tree
+- `origin` pointing at a GitHub repository
+- A workflow under `.github/workflows` that runs `npm publish` and declares `id-token: write`. `publish.yml` is preferred when it exists
 
-用 HTTPS 和个人访问令牌推送 `.github/workflows/` 时，令牌需要 `workflow` 权限。
+Pushing `.github/workflows/` over HTTPS with a personal access token requires the `workflow` scope.
 
-## 初始化工作流
+## Initialize a workflow
 
-项目还没有 `.github/workflows/publish.yml` 时：
+When the project does not yet have `.github/workflows/publish.yml`:
 
 ```bash
 cd /path/to/your-package
 npm-publish-oidc --init
 ```
 
-这会根据 `publish.yml.tmpl` 生成一份基础工作流。scope 包且未设置 `publishConfig.access` 时，发布命令写成 `npm publish --access public`。文件已存在时不会覆盖。
+This writes a basic workflow from `publish.yml.tmpl`. For a scoped package with no `publishConfig.access`, the publish command is `npm publish --access public`. An existing file is left unchanged.
 
-生成结果只是基础模板，可以按项目修改构建、测试和安装步骤。模板中的 `npm ci` 需要 `package-lock.json`。没有可用的 `test` 脚本时，需要删掉或改掉模板里的 `npm test`。`--init` 不提交、不推送、不发布，也不能和其他参数一起使用。
+The result is only a basic template. Change the build, test, and install steps for your project. `npm ci` in the template needs `package-lock.json`. Remove or replace the `npm test` step when the project has no usable `test` script. `--init` does not commit, push, or publish, and it cannot be combined with other arguments.
 
 ## npm Trusted Publisher
 
-在 npm 包的 Trusted Publisher 中配置 GitHub Actions：
+Configure GitHub Actions under the package's Trusted Publisher settings:
 
-| 字段 | 值 |
+| Field | Value |
 | --- | --- |
-| Organization or user | GitHub 仓库所有者 |
-| Repository | 仓库名 |
-| Workflow filename | `publish.yml`（只写文件名） |
-| Environment name | 留空 |
+| Organization or user | GitHub repository owner |
+| Repository | Repository name |
+| Workflow filename | `publish.yml` (filename only) |
+| Environment name | Leave empty |
 
-仓库所有者、仓库名和工作流文件名必须与 `origin`、实际使用的工作流一致。
+The owner, repository, and workflow filename must match `origin` and the workflow you actually use.
 
-## 发布
+## Publish
 
-在项目根目录执行：
+Run these from the project root:
 
 ```bash
-npm-publish-oidc --check          # 本地检查：已有的 typecheck、build、test，以及 npm pack --dry-run
-npm-publish-oidc --dry-run        # 检查并预览将推送的提交和标签
-npm-publish-oidc patch            # 0.1.0 → 0.1.1，推送后监控 Actions
+npm-publish-oidc --check          # Local checks: existing typecheck, build, and test, then npm pack --dry-run
+npm-publish-oidc --dry-run        # Check and preview the commit and tag that would be pushed
+npm-publish-oidc patch            # 0.1.0 → 0.1.1, then watch Actions
 npm-publish-oidc minor            # 0.1.0 → 0.2.0
 npm-publish-oidc major            # 0.1.0 → 1.0.0
-npm-publish-oidc                  # 不升版本，推送当前版本的 vX.Y.Z 标签
-npm-publish-oidc --no-watch patch # 推送后不等待 Actions
+npm-publish-oidc                  # Do not bump; push the vX.Y.Z tag for the current version
+npm-publish-oidc --no-watch patch # Push without waiting for Actions
 npm-publish-oidc --workflow release.yml patch
 ```
 
-`patch`、`minor`、`major` 可与 `--dry-run`、`--no-watch`、`--workflow` 组合，顺序不限。
+`patch`, `minor`, and `major` can be combined with `--dry-run`, `--no-watch`, and `--workflow` in any order.
 
-有多个 OIDC 发布工作流、且其中没有 `publish.yml` 时，用 `--workflow` 指定文件名。
+If several OIDC publish workflows exist and none of them is `publish.yml`, pass the filename with `--workflow`.
 
-正式发布会：
+A real publish:
 
-1. 运行项目里已定义的 `typecheck`、`build`，以及 `test:unit` 或 `test`
-2. 预览 `npm pack --dry-run`
-3. 按需执行 `npm version`，提交信息为 `chore: release v%s`
-4. 推送当前提交和 `vX.Y.Z` 标签
-5. 等待 GitHub Actions 结束，再查询 npm 上的版本
+1. Runs `typecheck`, `build`, and `test:unit` or `test` when those scripts exist
+2. Previews the package with `npm pack --dry-run`
+3. Runs `npm version` when a bump was requested, with the commit message `chore: release v%s`
+4. Pushes the current commit and the `vX.Y.Z` tag
+5. Waits for GitHub Actions to finish, then checks the version on npm
 
-本地不执行 `npm publish`。
+The local command does not run `npm publish`.
