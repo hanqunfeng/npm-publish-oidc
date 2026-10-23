@@ -17,6 +17,8 @@
 #   npm-publish-oidc --yes           确认发布计划后直接发布
 #   npm-publish-oidc --workflow FILE 指定 .github/workflows 下的工作流文件名
 #   npm-publish-oidc --init          缺少 publish.yml 时创建基础模板，不发布
+#   npm-publish-oidc --zh            使用中文输出
+#   npm-publish-oidc --help --zh     显示中文说明
 
 # 遇到命令失败、未定义变量或管道中任一命令失败时立即退出。
 set -euo pipefail
@@ -44,20 +46,51 @@ NETWORK_RETRY_DELAY=3
 WATCH_WORKFLOW=true
 # 正式发布前先展示计划并等待确认；--yes 跳过确认。
 ASSUME_YES=false
+# 默认英文输出；命令行带 --zh 时改为中文。
+USE_ZH=false
 # 发布前两项检查的失败标记。两项都跑完再退出，便于一次看到全部问题。
 CHECK_FAILED=0
 
 # 输出普通进度信息，并使用统一前缀方便阅读日志。
 log() { echo "==> $*"; }
 
+# 按 --zh 选择一句输出。第一个参数是英文，第二个参数是中文。
+msg() {
+	if [[ "$USE_ZH" == true ]]; then
+		printf '%s\n' "$2"
+	else
+		printf '%s\n' "$1"
+	fi
+}
+
 # 将致命错误写入标准错误并立即终止脚本。
-die() { echo "错误: $*" >&2; exit 1; }
+die() {
+	if [[ "$USE_ZH" == true ]]; then
+		echo "错误: $*" >&2
+	else
+		echo "error: $*" >&2
+	fi
+	exit 1
+}
 
 # 记录一项发布前检查失败，但不立刻退出。
-fail() { echo "错误: $*" >&2; CHECK_FAILED=1; }
+fail() {
+	if [[ "$USE_ZH" == true ]]; then
+		echo "错误: $*" >&2
+	else
+		echo "error: $*" >&2
+	fi
+	CHECK_FAILED=1
+}
 
 # 将非致命警告写入标准错误，但允许脚本继续执行。
-warn() { echo "警告: $*" >&2; }
+warn() {
+	if [[ "$USE_ZH" == true ]]; then
+		echo "警告: $*" >&2
+	else
+		echo "warning: $*" >&2
+	fi
+}
 
 # 执行可能因网络波动失败的命令，并按统一次数和间隔进行重试。
 # 第一个参数是日志中的操作说明，剩余参数组成真正要执行的命令。
@@ -71,15 +104,59 @@ retry_network() {
 			return 0
 		fi
 		if [[ $attempt -lt $NETWORK_MAX_ATTEMPTS ]]; then
-			log "网络操作失败，重试 ($attempt/$NETWORK_MAX_ATTEMPTS): $desc"
+			log "$(msg "Network operation failed, retrying ($attempt/$NETWORK_MAX_ATTEMPTS): $desc" "网络操作失败，重试 ($attempt/$NETWORK_MAX_ATTEMPTS): $desc")"
 			sleep "$NETWORK_RETRY_DELAY"
 		fi
 	done
 	return 1
 }
 
-# 输出命令行用法。--help 可以在任意目录执行。
+# 输出命令行用法。--help 为英文，--help --zh 为中文。两者都可以在任意目录执行。
 usage() {
+	if [[ "${1:-en}" == "zh" ]]; then
+		usage_zh
+	else
+		usage_en
+	fi
+}
+
+usage_en() {
+	cat <<EOF
+Usage: $CMD_NAME [patch|minor|major] [options]
+
+Run this in the project root. The current working directory is the project root.
+
+  (no arguments)     Push the vX.Y.Z tag for the current package.json version and trigger an OIDC publish
+  patch              Bump the patch version, then push (x.y.Z)
+  minor              Bump the minor version, then push (x.Y.0)
+  major              Bump the major version, then push (X.0.0)
+  --check            Run local pre-publish checks only
+  --dry-run          Check and preview the actions that would run, without pushing
+  --no-watch         Do not wait for GitHub Actions after the push
+  --yes, -y          Publish after showing the plan, without asking for confirmation
+  --workflow FILE    Workflow filename under .github/workflows, for example publish.yml
+  --init             Create a basic publish.yml template when it is missing. Does not publish
+  --zh               Print messages in Chinese. With --help, show this help in Chinese
+  --help             Show this help in English
+
+Options can be combined with patch, minor, or major in any order. --init cannot be combined with other arguments.
+
+The command first checks two things:
+  1. The current directory can be published to npm:
+     a valid package.json with a publishable name and version, and private is not true
+  2. The current directory is the git repository root
+
+Other requirements:
+  Git: clean working tree, and origin points to a GitHub repository
+  GitHub Actions: the workflow runs npm publish on a v* tag and declares id-token: write
+  GitHub CLI: installed and signed in (gh auth login), used to watch the publish
+  npm Trusted Publisher: configured for that GitHub repository and workflow filename
+
+This command does not run npm publish locally. GitHub Actions publishes with OIDC.
+EOF
+}
+
+usage_zh() {
 	cat <<EOF
 用法: $CMD_NAME [patch|minor|major] [选项]
 
@@ -95,6 +172,8 @@ usage() {
   --yes, -y          展示发布计划后直接发布，不再询问确认
   --workflow FILE    指定 .github/workflows 下的工作流文件名，例如 publish.yml
   --init             缺少 publish.yml 时创建基础模板。独立命令，不发布
+  --zh               使用中文输出。与 --help 一起使用时显示中文说明
+  --help             显示英文说明
 
 选项可与 patch/minor/major 组合，顺序不限。--init 不能和其他参数一起使用。
 
@@ -153,26 +232,26 @@ console.log(["OK", name, version, hasBin].join("\t"));
 validate_npm_project() {
 	local tools_ok=1
 	if ! command -v node >/dev/null 2>&1; then
-		fail "未安装 Node.js，无法确认当前目录是可发布的 npm 项目"
+		fail "$(msg "Node.js is not installed, so this directory cannot be checked as a publishable npm project" "未安装 Node.js，无法确认当前目录是可发布的 npm 项目")"
 		tools_ok=0
 	fi
 	if ! command -v npm >/dev/null 2>&1; then
-		fail "未安装 npm，无法发布到 npm"
+		fail "$(msg "npm is not installed, so this project cannot be published to npm" "未安装 npm，无法发布到 npm")"
 		tools_ok=0
 	fi
 	[[ $tools_ok -eq 1 ]] || return 0
 	if [[ ! -f package.json ]]; then
-		fail "当前目录没有 package.json，不是可发布的 npm 项目"
+		fail "$(msg "The current directory has no package.json, so it is not a publishable npm project" "当前目录没有 package.json，不是可发布的 npm 项目")"
 		return 0
 	fi
 
 	local meta line
 	if ! meta="$(read_package_publish_meta)"; then
-		fail "无法读取 package.json"
+		fail "$(msg "Cannot read package.json" "无法读取 package.json")"
 		return 0
 	fi
 	if [[ -z "$meta" ]]; then
-		fail "无法读取 package.json 的发布信息"
+		fail "$(msg "Cannot read publish metadata from package.json" "无法读取 package.json 的发布信息")"
 		return 0
 	fi
 
@@ -183,28 +262,28 @@ validate_npm_project() {
 				IFS=$'\t' read -r _ PACKAGE VERSION HAS_BIN <<<"$line"
 				;;
 			INVALID_JSON)
-				fail "package.json 不是合法 JSON，不能发布到 npm"
+				fail "$(msg "package.json is not valid JSON, so it cannot be published to npm" "package.json 不是合法 JSON，不能发布到 npm")"
 				;;
 			NOT_OBJECT)
-				fail "package.json 的内容必须是 JSON 对象"
+				fail "$(msg "package.json must contain a JSON object" "package.json 的内容必须是 JSON 对象")"
 				;;
 			PRIVATE)
-				fail "package.json 的 private 为 true，不能发布到 npm"
+				fail "$(msg "package.json has private set to true, so it cannot be published to npm" "package.json 的 private 为 true，不能发布到 npm")"
 				;;
 			MISSING_NAME)
-				fail "package.json 缺少 name，不能发布到 npm"
+				fail "$(msg "package.json is missing name, so it cannot be published to npm" "package.json 缺少 name，不能发布到 npm")"
 				;;
 			BAD_NAME$'\t'*)
-				fail "package.json 的 name 不是合法的 npm 包名: ${line#*$'\t'}"
+				fail "$(msg "package.json name is not a valid npm package name: ${line#*$'\t'}" "package.json 的 name 不是合法的 npm 包名: ${line#*$'\t'}")"
 				;;
 			MISSING_VERSION)
-				fail "package.json 缺少 version，不能发布到 npm"
+				fail "$(msg "package.json is missing version, so it cannot be published to npm" "package.json 缺少 version，不能发布到 npm")"
 				;;
 			BAD_VERSION$'\t'*)
-				fail "package.json 的 version 不是合法的语义化版本: ${line#*$'\t'}"
+				fail "$(msg "package.json version is not valid semver: ${line#*$'\t'}" "package.json 的 version 不是合法的语义化版本: ${line#*$'\t'}")"
 				;;
 			*)
-				fail "无法识别 package.json 检查结果: $line"
+				fail "$(msg "Unrecognized package.json check result: $line" "无法识别 package.json 检查结果: $line")"
 				;;
 		esac
 	done <<<"$meta"
@@ -213,22 +292,22 @@ validate_npm_project() {
 # 确认当前目录就是 git 仓库根目录，而不是仓库中的子目录。
 validate_git_root() {
 	if ! command -v git >/dev/null 2>&1; then
-		fail "未安装 git，无法确认当前目录是 git 仓库根目录"
+		fail "$(msg "git is not installed, so this directory cannot be checked as a git repository root" "未安装 git，无法确认当前目录是 git 仓库根目录")"
 		return 0
 	fi
 	if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-		fail "当前目录不是 git 仓库。请在 git 仓库根目录运行 $CMD_NAME"
+		fail "$(msg "The current directory is not a git repository. Run $CMD_NAME from the git repository root" "当前目录不是 git 仓库。请在 git 仓库根目录运行 $CMD_NAME")"
 		return 0
 	fi
 	local top cwd
 	top="$(git rev-parse --show-toplevel)" || {
-		fail "无法解析 git 仓库根目录"
+		fail "$(msg "Cannot resolve the git repository root" "无法解析 git 仓库根目录")"
 		return 0
 	}
 	cwd="$(pwd -P)"
 	top="$(cd "$top" && pwd -P)"
 	if [[ "$cwd" != "$top" ]]; then
-		fail "当前目录不是 git 仓库根目录。请切换到仓库根目录后再发布: $top"
+		fail "$(msg "The current directory is not the git repository root. Publish from: $top" "当前目录不是 git 仓库根目录。请切换到仓库根目录后再发布: $top")"
 		return 0
 	fi
 }
@@ -241,8 +320,8 @@ check_publish_context() {
 	if [[ $CHECK_FAILED -ne 0 ]]; then
 		exit 1
 	fi
-	log "可发布的 npm 项目: ${PACKAGE}@${VERSION}"
-	log "当前目录是 git 仓库根目录"
+	log "$(msg "Publishable npm project: ${PACKAGE}@${VERSION}" "可发布的 npm 项目: ${PACKAGE}@${VERSION}")"
+	log "$(msg "Current directory is the git repository root" "当前目录是 git 仓库根目录")"
 }
 
 # 读取 package.json 中某个 script 的命令。脚本不存在时输出空字符串。
@@ -264,30 +343,30 @@ run_checks() {
 	test_cmd="$(package_script test)"
 
 	if [[ -n "$typecheck_cmd" ]]; then
-		log "运行 typecheck..."
+		log "$(msg "Running typecheck..." "运行 typecheck...")"
 		npm run typecheck
 	else
-		log "跳过 typecheck（package.json 未定义该脚本）"
+		log "$(msg "Skipping typecheck (package.json does not define that script)" "跳过 typecheck（package.json 未定义该脚本）")"
 	fi
 
 	if [[ -n "$build_cmd" ]]; then
-		log "构建项目..."
+		log "$(msg "Building the project..." "构建项目...")"
 		npm run build
 	else
-		log "跳过 build（package.json 未定义该脚本）"
+		log "$(msg "Skipping build (package.json does not define that script)" "跳过 build（package.json 未定义该脚本）")"
 	fi
 
 	if [[ -n "$unit_cmd" ]] && ! is_placeholder_test "$unit_cmd"; then
-		log "运行 test:unit..."
+		log "$(msg "Running test:unit..." "运行 test:unit...")"
 		npm run test:unit
 	elif [[ -n "$test_cmd" ]] && ! is_placeholder_test "$test_cmd"; then
-		log "运行 test..."
+		log "$(msg "Running test..." "运行 test...")"
 		npm test
 	else
-		log "跳过测试（未定义 test:unit 或 test，或 test 仍是 npm 占位命令）"
+		log "$(msg "Skipping tests (no test:unit or test script, or test is still the npm placeholder)" "跳过测试（未定义 test:unit 或 test，或 test 仍是 npm 占位命令）")"
 	fi
 
-	log "预览发布包..."
+	log "$(msg "Previewing the package..." "预览发布包...")"
 	npm pack --dry-run
 }
 
@@ -301,7 +380,7 @@ workflow_is_oidc_publish() {
 warn_if_no_tag_trigger() {
 	local file="$1"
 	if ! grep -q 'tags:' "$file"; then
-		warn "工作流 ${WORKFLOW_FILE} 中未发现 tags 触发条件，推送版本标签后可能不会启动发布"
+		warn "$(msg "Workflow ${WORKFLOW_FILE} has no tags trigger, so pushing a version tag may not start a publish" "工作流 ${WORKFLOW_FILE} 中未发现 tags 触发条件，推送版本标签后可能不会启动发布")"
 	fi
 }
 
@@ -324,15 +403,15 @@ warn_other_oidc_workflows() {
 		shopt -u nullglob
 	fi
 	if [[ ${#found[@]} -gt 0 ]]; then
-		warn "已存在其他 OIDC 发布工作流: ${found[*]}。创建 publish.yml 后，发布时会优先使用 publish.yml"
+		warn "$(msg "Other OIDC publish workflows already exist: ${found[*]}. After publish.yml is created, publish will prefer publish.yml" "已存在其他 OIDC 发布工作流: ${found[*]}。创建 publish.yml 后，发布时会优先使用 publish.yml")"
 	fi
 }
 
 # 读取 origin，供模板注释填写 Trusted Publisher 的仓库信息。没有远程时保留占位文字。
 read_github_repo_parts() {
 	local url="" slug=""
-	REPO_OWNER="请填写"
-	REPO_NAME="请填写"
+	REPO_OWNER="$(msg "fill-in" "请填写")"
+	REPO_NAME="$(msg "fill-in" "请填写")"
 	if ! url="$(git remote get-url origin 2>/dev/null)"; then
 		return 0
 	fi
@@ -361,10 +440,10 @@ npm_publish_command() {
 write_basic_publish_workflow() {
 	local path="$1" publish_cmd="$2" template tmp
 	template="${SCRIPT_DIR}/publish.yml.tmpl"
-	[[ -f "$template" ]] || die "未找到工作流模板: $template"
+	[[ -f "$template" ]] || die "$(msg "Workflow template not found: $template" "未找到工作流模板: $template")"
 	tmp="$(mktemp "${path}.XXXXXX")"
 	cp "$template" "$tmp"
-	if ! node -e '
+	if ! USE_ZH="$USE_ZH" node -e '
 const fs = require("fs");
 const file = process.argv[1];
 let text = fs.readFileSync(file, "utf8");
@@ -376,7 +455,8 @@ const pairs = [
 ];
 for (const [key, value] of pairs) {
   if (!text.includes(key)) {
-    console.error("模板缺少占位符 " + key);
+    const missing = process.env.USE_ZH === "true" ? "模板缺少占位符 " : "template is missing placeholder ";
+    console.error(missing + key);
     process.exit(1);
   }
   text = text.split(key).join(value);
@@ -384,7 +464,7 @@ for (const [key, value] of pairs) {
 fs.writeFileSync(file, text);
 ' "$tmp" "$PACKAGE" "$publish_cmd" "$REPO_OWNER" "$REPO_NAME"; then
 		rm -f "$tmp"
-		die "无法生成 $path"
+		die "$(msg "Cannot generate $path" "无法生成 $path")"
 	fi
 	mv "$tmp" "$path"
 }
@@ -393,11 +473,11 @@ fs.writeFileSync(file, text);
 warn_basic_template_limits() {
 	local test_cmd=""
 	if [[ ! -f package-lock.json && ! -f npm-shrinkwrap.json ]]; then
-		warn "当前目录没有 package-lock.json，模板中的 npm ci 会失败。请先生成 lockfile，或改成适合本项目的安装命令"
+		warn "$(msg "No package-lock.json in the current directory, so npm ci in the template will fail. Generate a lockfile, or change the install step" "当前目录没有 package-lock.json，模板中的 npm ci 会失败。请先生成 lockfile，或改成适合本项目的安装命令")"
 	fi
 	test_cmd="$(package_script test)"
 	if [[ -z "$test_cmd" ]] || is_placeholder_test "$test_cmd"; then
-		warn "当前项目没有可用的 test 脚本，模板中的 npm test 步骤需要删除或改成实际的检查命令"
+		warn "$(msg "This project has no usable test script. Remove the npm test step in the template, or replace it with a real check" "当前项目没有可用的 test 脚本，模板中的 npm test 步骤需要删除或改成实际的检查命令")"
 	fi
 }
 
@@ -405,11 +485,11 @@ warn_basic_template_limits() {
 init_publish_workflow() {
 	local path=".github/workflows/publish.yml" publish_cmd
 	if [[ -e "$path" ]]; then
-		echo "已存在 $path，未做修改。"
+		echo "$(msg "$path already exists and was left unchanged." "已存在 $path，未做修改。")"
 		return 0
 	fi
 	if [[ -e .github/workflows/publish.yaml ]]; then
-		die "已存在 .github/workflows/publish.yaml。请直接修改该文件，或将其改名为 publish.yml"
+		die "$(msg ".github/workflows/publish.yaml already exists. Edit that file, or rename it to publish.yml" "已存在 .github/workflows/publish.yaml。请直接修改该文件，或将其改名为 publish.yml")"
 	fi
 
 	warn_other_oidc_workflows
@@ -418,8 +498,8 @@ init_publish_workflow() {
 	mkdir -p .github/workflows
 	write_basic_publish_workflow "$path" "$publish_cmd"
 	echo ""
-	echo "已创建 $path"
-	echo "这只是一个最基础的模板文件，可以按需进行修改。"
+	echo "$(msg "Created $path" "已创建 $path")"
+	echo "$(msg "This is only a basic template. Change it for your project." "这只是一个最基础的模板文件，可以按需进行修改。")"
 	warn_basic_template_limits
 }
 
@@ -427,17 +507,17 @@ init_publish_workflow() {
 discover_workflow() {
 	local path
 	if [[ -n "$WORKFLOW_FILE" ]]; then
-		[[ "$WORKFLOW_FILE" != */* && "$WORKFLOW_FILE" != *..* ]] || die "--workflow 只能是文件名，例如 publish.yml"
-		[[ "$WORKFLOW_FILE" == *.yml || "$WORKFLOW_FILE" == *.yaml ]] || die "--workflow 需要是 .yml 或 .yaml 文件"
+		[[ "$WORKFLOW_FILE" != */* && "$WORKFLOW_FILE" != *..* ]] || die "$(msg "--workflow must be a filename, for example publish.yml" "--workflow 只能是文件名，例如 publish.yml")"
+		[[ "$WORKFLOW_FILE" == *.yml || "$WORKFLOW_FILE" == *.yaml ]] || die "$(msg "--workflow must be a .yml or .yaml file" "--workflow 需要是 .yml 或 .yaml 文件")"
 		path=".github/workflows/$WORKFLOW_FILE"
-		[[ -f "$path" ]] || die "未找到工作流文件 $path"
-		workflow_is_oidc_publish "$path" || die "工作流 $WORKFLOW_FILE 需要执行 npm publish，并声明 permissions.id-token: write"
+		[[ -f "$path" ]] || die "$(msg "Workflow file not found: $path" "未找到工作流文件 $path")"
+		workflow_is_oidc_publish "$path" || die "$(msg "Workflow $WORKFLOW_FILE must run npm publish and declare permissions.id-token: write" "工作流 $WORKFLOW_FILE 需要执行 npm publish，并声明 permissions.id-token: write")"
 		warn_if_no_tag_trigger "$path"
-		log "使用工作流: $WORKFLOW_FILE"
+		log "$(msg "Using workflow: $WORKFLOW_FILE" "使用工作流: $WORKFLOW_FILE")"
 		return 0
 	fi
 
-	[[ -d .github/workflows ]] || die "当前项目没有 .github/workflows，无法通过 GitHub Actions OIDC 发布"
+	[[ -d .github/workflows ]] || die "$(msg "This project has no .github/workflows, so it cannot publish through GitHub Actions OIDC" "当前项目没有 .github/workflows，无法通过 GitHub Actions OIDC 发布")"
 
 	local nullglob_on=0
 	shopt -q nullglob && nullglob_on=1
@@ -454,7 +534,7 @@ discover_workflow() {
 	fi
 
 	if [[ ${#found[@]} -eq 0 ]]; then
-		die "未找到 OIDC 发布工作流。请添加 .github/workflows/publish.yml，使其在推送 v* 标签时执行 npm publish，并声明 id-token: write。也可使用 --workflow 指定文件名"
+		die "$(msg "No OIDC publish workflow found. Add .github/workflows/publish.yml that runs npm publish on a v* tag and declares id-token: write, or pass --workflow" "未找到 OIDC 发布工作流。请添加 .github/workflows/publish.yml，使其在推送 v* 标签时执行 npm publish，并声明 id-token: write。也可使用 --workflow 指定文件名")"
 	fi
 
 	local name candidate=""
@@ -468,11 +548,11 @@ discover_workflow() {
 		candidate="${found[0]}"
 	fi
 	if [[ -z "$candidate" ]]; then
-		die "找到多个 OIDC 发布工作流: ${found[*]}。请使用 --workflow 指定文件名"
+		die "$(msg "Found multiple OIDC publish workflows: ${found[*]}. Pass --workflow with a filename" "找到多个 OIDC 发布工作流: ${found[*]}。请使用 --workflow 指定文件名")"
 	fi
 	WORKFLOW_FILE="$candidate"
 	warn_if_no_tag_trigger ".github/workflows/$WORKFLOW_FILE"
-	log "使用工作流: $WORKFLOW_FILE"
+	log "$(msg "Using workflow: $WORKFLOW_FILE" "使用工作流: $WORKFLOW_FILE")"
 }
 
 # 从 origin 地址提取 GitHub 的 owner/repo。
@@ -513,27 +593,27 @@ redact_git_url() {
 # 确认 origin 存在，并且指向 GitHub 仓库。
 check_remote_configured() {
 	local url repo
-	url="$(git remote get-url origin 2>/dev/null)" || die "未配置 origin 远程"
+	url="$(git remote get-url origin 2>/dev/null)" || die "$(msg "origin remote is not configured" "未配置 origin 远程")"
 	log "origin: $(redact_git_url "$url")"
-	repo="$(github_repo_from_url "$url")" || die "origin 不是 GitHub 仓库地址，OIDC 发布需要 GitHub 远程: $(redact_git_url "$url")"
+	repo="$(github_repo_from_url "$url")" || die "$(msg "origin is not a GitHub repository URL. OIDC publish needs a GitHub remote: $(redact_git_url "$url")" "origin 不是 GitHub 仓库地址，OIDC 发布需要 GitHub 远程: $(redact_git_url "$url")")"
 	GITHUB_REPO="$repo"
-	log "GitHub 仓库: $GITHUB_REPO"
+	log "$(msg "GitHub repository: $GITHUB_REPO" "GitHub 仓库: $GITHUB_REPO")"
 }
 
 # 检查 GitHub CLI 是否已安装并登录。
 check_gh_auth() {
-	command -v gh >/dev/null 2>&1 || die "未安装 GitHub CLI。请安装: https://cli.github.com/"
+	command -v gh >/dev/null 2>&1 || die "$(msg "GitHub CLI is not installed. Install it: https://cli.github.com/" "未安装 GitHub CLI。请安装: https://cli.github.com/")"
 	retry_network "gh auth status" gh auth status >/dev/null \
-		|| die "GitHub CLI 未登录或无法连接 GitHub。请运行: gh auth login"
-	log "GitHub CLI 已认证"
+		|| die "$(msg "GitHub CLI is not signed in or cannot reach GitHub. Run: gh auth login" "GitHub CLI 未登录或无法连接 GitHub。请运行: gh auth login")"
+	log "$(msg "GitHub CLI is authenticated" "GitHub CLI 已认证")"
 }
 
 # 确认 Git 工作区没有已修改、已暂存或未跟踪的文件。
 check_git_clean() {
 	if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
-		die "工作区有未提交的更改，请先 commit 或 stash"
+		die "$(msg "The working tree has uncommitted changes. Commit or stash them first" "工作区有未提交的更改，请先 commit 或 stash")"
 	fi
-	log "git 工作区干净"
+	log "$(msg "git working tree is clean" "git 工作区干净")"
 }
 
 # 检查当前分支是否为 main/master。其他分支只警告，不终止发布。
@@ -541,7 +621,7 @@ check_on_main_branch() {
 	local branch
 	branch="$(git branch --show-current 2>/dev/null || true)"
 	if [[ -n "$branch" && "$branch" != "main" && "$branch" != "master" ]]; then
-		warn "当前分支为 '$branch'，建议在 main 分支发布"
+		warn "$(msg "Current branch is '$branch'. Publishing from main is recommended" "当前分支为 '$branch'，建议在 main 分支发布")"
 	fi
 }
 
@@ -583,33 +663,33 @@ check_not_already_published() {
 		fi
 		published=""
 		if [[ $attempt -lt $NETWORK_MAX_ATTEMPTS ]]; then
-			log "查询 npm 版本失败，重试 ($attempt/$NETWORK_MAX_ATTEMPTS)"
+			log "$(msg "Failed to query the npm version, retrying ($attempt/$NETWORK_MAX_ATTEMPTS)" "查询 npm 版本失败，重试 ($attempt/$NETWORK_MAX_ATTEMPTS)")"
 			sleep "$NETWORK_RETRY_DELAY"
 		else
-			warn "无法查询 npm 当前版本（已重试 $NETWORK_MAX_ATTEMPTS 次），继续发布"
+			warn "$(msg "Cannot query the current npm version (retried $NETWORK_MAX_ATTEMPTS times). Continuing" "无法查询 npm 当前版本（已重试 $NETWORK_MAX_ATTEMPTS 次），继续发布")"
 		fi
 	done
 	if [[ $rc -eq 0 && "$published" == "$version" ]]; then
-		die "版本 $version 已在 npm 上发布。请先用 patch/minor/major 升版本"
+		die "$(msg "Version $version is already published on npm. Bump it with patch, minor, or major first" "版本 $version 已在 npm 上发布。请先用 patch/minor/major 升版本")"
 	fi
 	if [[ $rc -eq 2 ]]; then
-		log "将首次发布: $version（npm 上尚无 $PACKAGE）"
+		log "$(msg "First publish: $version ($PACKAGE is not on npm yet)" "将首次发布: $version（npm 上尚无 $PACKAGE）")"
 		return 0
 	fi
-	log "将发布新版本: $version（npm 当前最新: ${published:-无}）"
+	log "$(msg "Publishing new version: $version (npm latest: ${published:-none})" "将发布新版本: $version（npm 当前最新: ${published:-无}）")"
 }
 
 # 输出 Trusted Publisher 配置提醒。npm 上的仓库和工作流文件名必须与这里一致。
 check_trusted_publisher_hint() {
-	log "发布将由 GitHub Actions (${WORKFLOW_FILE}) 通过 OIDC 完成"
-	log "请确认 npm 已配置 Trusted Publisher: ${GITHUB_REPO} / ${WORKFLOW_FILE}"
+	log "$(msg "GitHub Actions (${WORKFLOW_FILE}) will publish through OIDC" "发布将由 GitHub Actions (${WORKFLOW_FILE}) 通过 OIDC 完成")"
+	log "$(msg "Confirm the npm Trusted Publisher matches ${GITHUB_REPO} / ${WORKFLOW_FILE}" "请确认 npm 已配置 Trusted Publisher: ${GITHUB_REPO} / ${WORKFLOW_FILE}")"
 }
 
 # 使用 npm version 按 patch/minor/major 提升版本。
 # npm version 会修改 package.json 和 lock 文件，并创建 release commit 与 vX.Y.Z 标签。
 bump_version() {
 	local level="$1"
-	log "升级版本 ($level)..."
+	log "$(msg "Bumping version ($level)..." "升级版本 ($level)...")"
 	npm version "$level" -m "chore: release v%s"
 }
 
@@ -617,10 +697,10 @@ bump_version() {
 ensure_local_tag() {
 	local tag="$1"
 	if git rev-parse "$tag" >/dev/null 2>&1; then
-		log "本地 tag $tag 已存在"
+		log "$(msg "Local tag $tag already exists" "本地 tag $tag 已存在")"
 		return 0
 	fi
-	log "创建本地 tag $tag..."
+	log "$(msg "Creating local tag $tag..." "创建本地 tag $tag...")"
 	git tag "$tag"
 }
 
@@ -636,7 +716,7 @@ remote_has_tag() {
 			return 1
 		fi
 		if [[ $attempt -lt $NETWORK_MAX_ATTEMPTS ]]; then
-			log "查询远程 tag 失败，重试 ($attempt/$NETWORK_MAX_ATTEMPTS): $tag"
+			log "$(msg "Failed to query remote tag, retrying ($attempt/$NETWORK_MAX_ATTEMPTS): $tag" "查询远程 tag 失败，重试 ($attempt/$NETWORK_MAX_ATTEMPTS): $tag")"
 			sleep "$NETWORK_RETRY_DELAY"
 		fi
 	done
@@ -646,29 +726,29 @@ remote_has_tag() {
 # 先推送当前 commit，再推送触发工作流的版本标签。
 push_git() {
 	local tag="$1"
-	log "推送 commit 到 origin..."
+	log "$(msg "Pushing commit to origin..." "推送 commit 到 origin...")"
 	retry_network "git push origin HEAD" git push origin HEAD \
-		|| die "git push 失败（已重试 $NETWORK_MAX_ATTEMPTS 次）"
+		|| die "$(msg "git push failed (retried $NETWORK_MAX_ATTEMPTS times)" "git push 失败（已重试 $NETWORK_MAX_ATTEMPTS 次）")"
 
 	local remote_status=0
 	remote_has_tag "$tag" || remote_status=$?
 	if [[ $remote_status -eq 0 ]]; then
-		warn "远程 tag $tag 已存在，跳过 git push --tags"
+		warn "$(msg "Remote tag $tag already exists. Skipping git push of the tag" "远程 tag $tag 已存在，跳过 git push --tags")"
 		return 0
 	fi
 	if [[ $remote_status -eq 2 ]]; then
-		die "无法确认远程 tag $tag 是否存在（已重试 $NETWORK_MAX_ATTEMPTS 次）"
+		die "$(msg "Cannot tell whether remote tag $tag exists (retried $NETWORK_MAX_ATTEMPTS times)" "无法确认远程 tag $tag 是否存在（已重试 $NETWORK_MAX_ATTEMPTS 次）")"
 	fi
 
-	log "推送 tag $tag 到 origin..."
+	log "$(msg "Pushing tag $tag to origin..." "推送 tag $tag 到 origin...")"
 	retry_network "git push origin $tag" git push origin "$tag" \
-		|| die "git push tag $tag 失败（已重试 $NETWORK_MAX_ATTEMPTS 次）"
+		|| die "$(msg "git push of tag $tag failed (retried $NETWORK_MAX_ATTEMPTS times)" "git push tag $tag 失败（已重试 $NETWORK_MAX_ATTEMPTS 次）")"
 }
 
 # 等待标签对应的工作流出现，并持续监控到运行结束。
 watch_workflow() {
 	local tag="$1" run_id attempt=0 list_failed=0
-	log "等待 GitHub Actions 工作流启动..."
+	log "$(msg "Waiting for the GitHub Actions workflow to start..." "等待 GitHub Actions 工作流启动...")"
 	while ((attempt < 30)); do
 		if run_id="$(gh run list \
 			--repo "$GITHUB_REPO" \
@@ -684,7 +764,7 @@ watch_workflow() {
 		else
 			list_failed=1
 			run_id=""
-			log "查询工作流失败，重试 ($((attempt + 1))/30)"
+			log "$(msg "Failed to query the workflow, retrying ($((attempt + 1))/30)" "查询工作流失败，重试 ($((attempt + 1))/30)")"
 		fi
 		sleep 2
 		((attempt += 1))
@@ -692,18 +772,18 @@ watch_workflow() {
 
 	if [[ -z "$run_id" ]]; then
 		if [[ $list_failed -eq 1 ]]; then
-			die "无法查询 GitHub Actions（已重试 30 次）。请稍后查看: gh run list --repo $GITHUB_REPO --workflow $WORKFLOW_FILE"
+			die "$(msg "Cannot query GitHub Actions (retried 30 times). Check later: gh run list --repo $GITHUB_REPO --workflow $WORKFLOW_FILE" "无法查询 GitHub Actions（已重试 30 次）。请稍后查看: gh run list --repo $GITHUB_REPO --workflow $WORKFLOW_FILE")"
 		fi
-		warn "未找到对应的工作流运行，请手动查看:"
+		warn "$(msg "No matching workflow run was found. Check it manually:" "未找到对应的工作流运行，请手动查看:")"
 		warn "  gh run list --repo $GITHUB_REPO --workflow $WORKFLOW_FILE"
 		return 0
 	fi
 
-	log "监控工作流运行 #$run_id ..."
+	log "$(msg "Watching workflow run #$run_id ..." "监控工作流运行 #$run_id ...")"
 	local state status conclusion
 	for ((attempt = 1; attempt <= NETWORK_MAX_ATTEMPTS; attempt++)); do
 		if gh run watch "$run_id" --repo "$GITHUB_REPO" --exit-status; then
-			log "GitHub Actions 发布成功"
+			log "$(msg "GitHub Actions publish succeeded" "GitHub Actions 发布成功")"
 			return 0
 		fi
 
@@ -714,48 +794,48 @@ watch_workflow() {
 		conclusion="${state#*$'\t'}"
 		if [[ "$status" == "completed" ]]; then
 			if [[ "$conclusion" == "success" ]]; then
-				log "GitHub Actions 发布成功"
+				log "$(msg "GitHub Actions publish succeeded" "GitHub Actions 发布成功")"
 				return 0
 			fi
-			die "GitHub Actions 发布失败。查看日志: gh run view $run_id --repo $GITHUB_REPO --log-failed"
+			die "$(msg "GitHub Actions publish failed. See the log: gh run view $run_id --repo $GITHUB_REPO --log-failed" "GitHub Actions 发布失败。查看日志: gh run view $run_id --repo $GITHUB_REPO --log-failed")"
 		fi
 
 		if [[ $attempt -lt $NETWORK_MAX_ATTEMPTS ]]; then
-			log "监控连接断开，重新连接 ($attempt/$NETWORK_MAX_ATTEMPTS): run #$run_id"
+			log "$(msg "Watch connection dropped, reconnecting ($attempt/$NETWORK_MAX_ATTEMPTS): run #$run_id" "监控连接断开，重新连接 ($attempt/$NETWORK_MAX_ATTEMPTS): run #$run_id")"
 			sleep "$NETWORK_RETRY_DELAY"
 		fi
 	done
-	die "监控工作流 #$run_id 失败（已重试 $NETWORK_MAX_ATTEMPTS 次）。查看日志: gh run view $run_id --repo $GITHUB_REPO --log-failed"
+	die "$(msg "Watching workflow #$run_id failed (retried $NETWORK_MAX_ATTEMPTS times). See the log: gh run view $run_id --repo $GITHUB_REPO --log-failed" "监控工作流 #$run_id 失败（已重试 $NETWORK_MAX_ATTEMPTS 次）。查看日志: gh run view $run_id --repo $GITHUB_REPO --log-failed")"
 }
 
 # 轮询 npm 注册表，确认 Actions 发布的 latest 版本已同步为本地版本。
 verify_publish() {
 	local version published attempt rc
 	version="$(get_package_version)"
-	log "验证 npm 上的版本..."
+	log "$(msg "Verifying the version on npm..." "验证 npm 上的版本...")"
 	for ((attempt = 1; attempt <= NETWORK_MAX_ATTEMPTS; attempt++)); do
 		rc=0
 		published="$(query_published_version)" || rc=$?
 		published="${published//[[:space:]]/}"
 		if [[ $rc -eq 0 && "$published" == "$version" ]]; then
-			log "发布成功: $PACKAGE@$version"
-			log "本地已查到该版本，无需再执行 Actions 日志中的复查命令"
+			log "$(msg "Published: $PACKAGE@$version" "发布成功: $PACKAGE@$version")"
+			log "$(msg "The version is already visible locally. The recheck command in the Actions log is not needed" "本地已查到该版本，无需再执行 Actions 日志中的复查命令")"
 			echo ""
 			echo "  npm:     https://www.npmjs.com/package/${PACKAGE#@}"
 			echo "  GitHub:  https://github.com/${GITHUB_REPO}/releases/tag/v${version}"
 			if [[ "$HAS_BIN" == "1" ]]; then
-				echo "  安装:    npm install -g $PACKAGE"
+				echo "  $(msg "install" "安装"):    npm install -g $PACKAGE"
 			else
-				echo "  安装:    npm install $PACKAGE"
+				echo "  $(msg "install" "安装"):    npm install $PACKAGE"
 			fi
 			return 0
 		fi
 		if [[ $attempt -lt $NETWORK_MAX_ATTEMPTS ]]; then
-			log "等待 npm 注册表同步 ($attempt/$NETWORK_MAX_ATTEMPTS): npm=${published:-无}, 本地=$version"
+			log "$(msg "Waiting for the npm registry to sync ($attempt/$NETWORK_MAX_ATTEMPTS): npm=${published:-none}, local=$version" "等待 npm 注册表同步 ($attempt/$NETWORK_MAX_ATTEMPTS): npm=${published:-无}, 本地=$version")"
 			sleep "$NETWORK_RETRY_DELAY"
 		fi
 	done
-	warn "npm 注册表尚未同步到 $version。包已发布。可稍后执行:"
+	warn "$(msg "The npm registry has not synced to $version yet. The package was published. Try later:" "npm 注册表尚未同步到 $version。包已发布。可稍后执行:")"
 	warn "  npm view $PACKAGE version"
 	warn "  npm view ${PACKAGE}@${version} version"
 }
@@ -788,14 +868,17 @@ preview_bumped_version() {
 
 # 正式发布前打印将要执行的版本、仓库和工作流。此时还没有提交或推送。
 print_publish_plan() {
-	local bump_label="无" next_version tag branch watch_label="是"
+	local bump_label next_version tag branch watch_label title
+	bump_label="$(msg "none" "无")"
+	watch_label="$(msg "yes" "是")"
+	title="$(msg "npm-publish-oidc publish plan" "npm-publish-oidc 发布计划")"
 	branch="$(git branch --show-current 2>/dev/null || true)"
 	if [[ -n "$bump" ]]; then
 		bump_label="$bump"
 		next_version="$(preview_bumped_version "$bump")"
 		if [[ -z "$next_version" ]]; then
 			next_version="npm version ${bump}"
-			tag="v<新版本>"
+			tag="$(msg "v<new version>" "v<新版本>")"
 		else
 			tag="v${next_version}"
 		fi
@@ -804,79 +887,86 @@ print_publish_plan() {
 		tag="v${VERSION}"
 	fi
 	if [[ "$WATCH_WORKFLOW" != "true" ]]; then
-		watch_label="否"
+		watch_label="$(msg "no" "否")"
 	fi
-	cat <<EOF
-
-========================================
-  npm-publish-oidc 发布计划
-========================================
-  包       : ${PACKAGE}
-  当前版本 : ${VERSION}
-  新版本   : ${next_version}  (tag: ${tag})
-  bump     : ${bump_label}
-  仓库     : ${GITHUB_REPO}
-  工作流   : .github/workflows/${WORKFLOW_FILE}
-  分支     : ${branch:-detached}
-  监控     : ${watch_label}
-========================================
-
-EOF
+	printf '\n========================================\n  %s\n========================================\n' "$title"
+	printf '  %s: %s\n' "$(msg "package" "包")" "$PACKAGE"
+	printf '  %s: %s\n' "$(msg "current" "当前版本")" "$VERSION"
+	printf '  %s: %s (tag: %s)\n' "$(msg "next" "新版本")" "$next_version" "$tag"
+	printf '  %s: %s\n' "bump" "$bump_label"
+	printf '  %s: %s\n' "$(msg "repository" "仓库")" "$GITHUB_REPO"
+	printf '  %s: %s\n' "$(msg "workflow" "工作流")" ".github/workflows/${WORKFLOW_FILE}"
+	printf '  %s: %s\n' "$(msg "branch" "分支")" "${branch:-detached}"
+	printf '  %s: %s\n' "$(msg "watch" "监控")" "$watch_label"
+	printf '========================================\n\n'
 }
 
 # 等待用户输入 y 或 Y。--yes 直接通过；其他输入或读到结尾则取消。
 confirm_publish() {
 	local reply=""
 	if [[ "$ASSUME_YES" == "true" ]]; then
-		log "已指定 --yes，按发布计划继续"
+		log "$(msg "Continuing because --yes was given" "已指定 --yes，按发布计划继续")"
 		return 0
 	fi
-	printf '确认按上述计划发布？ [y/N] '
+	printf '%s ' "$(msg "Publish with this plan? [y/N]" "确认按上述计划发布？ [y/N]")"
 	if ! read -r reply; then
 		printf '\n'
-		die "已取消"
+		die "$(msg "Cancelled" "已取消")"
 	fi
-	[[ "$reply" == "y" || "$reply" == "Y" ]] || die "已取消"
+	[[ "$reply" == "y" || "$reply" == "Y" ]] || die "$(msg "Cancelled" "已取消")"
 }
 
 # 输出已触发发布的标签、工作流文件和 GitHub Actions 页面地址。
 print_summary() {
 	local tag="$1"
 	echo ""
-	echo "已触发 OIDC 发布:"
-	echo "  包:       $PACKAGE@$(get_package_version)"
-	echo "  标签:     $tag"
-	echo "  仓库:     $GITHUB_REPO"
-	echo "  工作流:   .github/workflows/${WORKFLOW_FILE}"
-	echo "  操作面板: https://github.com/${GITHUB_REPO}/actions/workflows/${WORKFLOW_FILE}"
+	echo "$(msg "OIDC publish triggered:" "已触发 OIDC 发布:")"
+	echo "  $(msg "package" "包"):       $PACKAGE@$(get_package_version)"
+	echo "  $(msg "tag" "标签"):     $tag"
+	echo "  $(msg "repository" "仓库"):     $GITHUB_REPO"
+	echo "  $(msg "workflow" "工作流"):   .github/workflows/${WORKFLOW_FILE}"
+	echo "  $(msg "actions" "操作面板"): https://github.com/${GITHUB_REPO}/actions/workflows/${WORKFLOW_FILE}"
 }
 
 # 解析参数并编排发布流程。
 # --help 可以在任意目录使用。其他命令会先检查当前目录，再执行对应模式。
 main() {
-	local mode="" bump=""
+	local mode="" bump="" arg help=false
+
+	for arg in "$@"; do
+		case "$arg" in
+			--zh) USE_ZH=true ;;
+			-h | --help) help=true ;;
+		esac
+	done
+	if [[ "$help" == true ]]; then
+		if [[ "$USE_ZH" == true ]]; then
+			usage zh
+		else
+			usage en
+		fi
+		exit 0
+	fi
 
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-			-h | --help)
-				usage
-				exit 0
+			--zh)
 				;;
 			--check)
 				if [[ -n "$mode" && "$mode" != "check" ]]; then
-					die "不能同时指定 --check 和 --$mode"
+					die "$(msg "Cannot combine --check with --$mode" "不能同时指定 --check 和 --$mode")"
 				fi
 				mode="check"
 				;;
 			--dry-run)
 				if [[ -n "$mode" && "$mode" != "dry-run" ]]; then
-					die "不能同时指定 --dry-run 和 --$mode"
+					die "$(msg "Cannot combine --dry-run with --$mode" "不能同时指定 --dry-run 和 --$mode")"
 				fi
 				mode="dry-run"
 				;;
 			--init)
 				if [[ -n "$mode" && "$mode" != "init" ]]; then
-					die "不能同时指定 --init 和 --$mode"
+					die "$(msg "Cannot combine --init with --$mode" "不能同时指定 --init 和 --$mode")"
 				fi
 				mode="init"
 				;;
@@ -887,16 +977,16 @@ main() {
 				ASSUME_YES=true
 				;;
 			--workflow)
-				[[ $# -ge 2 ]] || die "--workflow 需要工作流文件名，例如 publish.yml"
+				[[ $# -ge 2 ]] || die "$(msg "--workflow needs a workflow filename, for example publish.yml" "--workflow 需要工作流文件名，例如 publish.yml")"
 				shift
 				WORKFLOW_FILE="$1"
 				;;
 			patch | minor | major)
-				[[ -z "$bump" ]] || die "不能同时指定多个版本级别: $bump 和 $1"
+				[[ -z "$bump" ]] || die "$(msg "Cannot specify more than one version level: $bump and $1" "不能同时指定多个版本级别: $bump 和 $1")"
 				bump="$1"
 				;;
 			*)
-				die "未知参数: $1（使用 --help 查看用法）"
+				die "$(msg "Unknown argument: $1 (use --help)" "未知参数: $1（使用 --help 查看用法）")"
 				;;
 		esac
 		shift
@@ -904,14 +994,14 @@ main() {
 
 	if [[ "$mode" == "init" ]]; then
 		if [[ -n "$bump" || -n "$WORKFLOW_FILE" || "$WATCH_WORKFLOW" == "false" ]]; then
-			die "--init 是独立命令，不能与版本级别或其他选项一起使用"
+			die "$(msg "--init is a standalone command and cannot be combined with a version level or other options" "--init 是独立命令，不能与版本级别或其他选项一起使用")"
 		fi
 	fi
 
 	# 当前工作目录就是发布根目录。这里固定下来，避免后续命令改变相对路径的含义。
 	ROOT="$(pwd -P)"
 	cd "$ROOT"
-	log "项目根目录: $ROOT"
+	log "$(msg "Project root: $ROOT" "项目根目录: $ROOT")"
 	check_publish_context
 
 	case "$mode" in
@@ -923,7 +1013,7 @@ main() {
 			check_remote_configured
 			discover_workflow
 			run_checks
-			log "检查通过"
+			log "$(msg "Checks passed" "检查通过")"
 			exit 0
 			;;
 		dry-run)
@@ -932,22 +1022,22 @@ main() {
 			check_remote_configured
 			discover_workflow
 			run_checks
-			log "[dry-run] 包: $PACKAGE@$(get_package_version)"
-			log "[dry-run] 仓库: $GITHUB_REPO"
-			log "[dry-run] 工作流: .github/workflows/$WORKFLOW_FILE"
+			log "[dry-run] $(msg "package" "包"): $PACKAGE@$(get_package_version)"
+			log "[dry-run] $(msg "repository" "仓库"): $GITHUB_REPO"
+			log "[dry-run] $(msg "workflow" "工作流"): .github/workflows/$WORKFLOW_FILE"
 			if [[ -n "$bump" ]]; then
-				log "[dry-run] 将执行: npm version $bump -m \"chore: release v%s\""
+				log "[dry-run] $(msg "will run" "将执行"): npm version $bump -m \"chore: release v%s\""
 			else
-				log "[dry-run] 将推送 tag: $(get_version_tag)"
+				log "[dry-run] $(msg "will push tag" "将推送 tag"): $(get_version_tag)"
 			fi
-			log "[dry-run] 将执行: git push origin HEAD && git push origin <tag>"
-			log "[dry-run] GitHub Actions 将自动发布到 npm 并创建 Release"
+			log "[dry-run] $(msg "will run" "将执行"): git push origin HEAD && git push origin <tag>"
+			log "[dry-run] $(msg "GitHub Actions will publish to npm and create a Release" "GitHub Actions 将自动发布到 npm 并创建 Release")"
 			exit 0
 			;;
 		"")
 			;;
 		*)
-			die "内部错误: 未知模式 $mode"
+			die "$(msg "Internal error: unknown mode $mode" "内部错误: 未知模式 $mode")"
 			;;
 	esac
 
@@ -977,7 +1067,7 @@ main() {
 		watch_workflow "$tag"
 		verify_publish
 	else
-		log "已跳过工作流监控 (--no-watch)"
+		log "$(msg "Skipped workflow watch (--no-watch)" "已跳过工作流监控 (--no-watch)")"
 	fi
 }
 
